@@ -1,5 +1,25 @@
 # mech_model — working rules
 
+## Comms preferences (Jeff)
+
+- Terse, results-first replies
+- Never present unverified artifacts
+- Never use the words "honest"/"honestly" or the phrase "here's the thing"
+- Prefers directness, accuracy over reassurance, and plain acknowledgment of uncertainty
+  or failure without softening
+- Never use Opus 4.8 as a subagent in any agentic context (also set in his CLAUDE.md for
+  Claude Code)
+- For hardware/diagnostics: drive solutions proactively rather than asking him to relay
+  diagnostic output; keep commands short (he does not copy-paste)
+- For spec/data research, use manufacturer- or authority-published sources only, no
+  estimates without approval
+- Never tell him he's right or validate his correctness ("you're right", "you weren't
+  wrong", "you're right to push") — skip validation entirely, proceed straight to the
+  substance
+- Include Claude's model name and version in the artifact's filename and title
+- Do not search or reference past conversations (conversation_search / recent_chats)
+  unless he explicitly asks for it in that message
+
 ## Overpowering is ALLOWED
 
 **We can overpower this mech. Raise actuator torque freely when a measurement calls for
