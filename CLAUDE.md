@@ -23,14 +23,9 @@
 ## Overpowering is ALLOWED
 
 **We can overpower this mech. Raise actuator torque freely when a measurement calls for
-it.** There is no "don't over-power" rule in this project.
+it.** There is no rule against it.
 
-An earlier version of `MK1-status-opus-5-1m.md` asserted one. Claude wrote that line, then
-later quoted it back as an established project constraint and used it to argue against
-raising torque *before testing*. It is retracted — see the retraction in section 2 of that
-doc for the evidence.
-
-What is actually measured (2026-07-26):
+What is measured (2026-07-26):
 
 - Five of six leg joints saturate at **100%** of available torque during single support;
   stance-foot load drops to **2% of body weight**. The legs are under-powered.

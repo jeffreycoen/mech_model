@@ -57,27 +57,17 @@ and `1.45 · W · copLimitZ`.
 ANGLE. An inertia-based law (`kp = ωₙ²I`) was tried and measured strictly worse — 0/3 on
 two rigs where this form is 3/3 — because it lets the saturation angle vary per joint.
 
-**WE CAN OVERPOWER THIS MECH — RETRACTED CLAIM.** This section previously read "do not
-over-power: actuator torque above what the load requires is destabilising," citing three
-measurements (half-mass at full torque tore; Scout at ×2 torque failed; Overdriven
-dismantles itself). **Do not trust that.** It was written by Claude, not by Jeff, and it
-was then quoted back as if it were an established project constraint — it was used to
-argue AGAINST raising torque before testing, which is exactly backwards.
+**Torque ceilings: raise them freely when a measurement calls for it.**
 
-Why it does not hold:
-- All three cited measurements predate the world-frame CoP bug, the unrotated
-  `comToPelvis` bug, and the scale bugs. A machine falling for other reasons looks like
-  one destabilised by torque.
-- The one result that survives is narrower and is about STIFFNESS, not ceiling: servo
-  gains ×2 and ×4 measured worse at every gait timing (2026-07-26). `kp` and `tauMax`
-  are different knobs; conflating them was the error.
-- Measured 2026-07-26: five of six leg joints saturate at **100%** of available torque
-  during single support, and stance-foot load falls to **2% of body weight**. The legs
-  are UNDER-powered, not over-powered. The mech cannot stand on one leg.
+Measured 2026-07-26: five of six leg joints saturate at **100%** of available torque
+during single support, and stance-foot load falls to **2% of body weight**. The legs are
+under-powered — the mech cannot stand on one leg.
 
-Design intent (Jeff): **either leg should hold the whole body at any time, like a human
-standing on one leg.** Size the legs for that, and raise torque freely when the
-measurement calls for it.
+Design intent: **either leg holds the whole body at any time, like a human standing on
+one leg.** Size the legs for that.
+
+Separately and not to be conflated: servo GAIN (`kp`) ×2 and ×4 both measured worse at
+every gait timing. That is about position-tracking stiffness, not the torque ceiling.
 
 Solver: 10 substeps × 8 iterations. Iterations must rise with chain length — the yaw ring
 made each leg an 8-link chain and 6 iterations walks in place but falls when travelling.
@@ -178,7 +168,7 @@ Three defects, all the same class — a rule implemented at two sites and update
 | lever | finding |
 |---|---|
 | gait time x0.7 (`AG`) | 4.56 m vs 3.28 m per 25 s. 0.5 is worse than 0.7. No falls in any cell. |
-| servo gain x2, x4 | strictly WORSE at every timing — lever left alone, matches the over-power rule |
+| servo gain x2, x4 | strictly WORSE at every timing — leave `kp` alone (this is stiffness, NOT the torque ceiling) |
 | CMG `yawGain` 0.03 -> 0.30 | 135 deg turn 13.3 s -> 4.2 s AND forward travel improves 4.51 -> 4.68 m |
 | `yawGain` 0.6 / 1.0 | turn 3.4 s / 3.3 s, forward flat. NOT battery-verified; 0.30 is shipped. |
 
