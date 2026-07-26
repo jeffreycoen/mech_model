@@ -1,0 +1,28 @@
+{
+  "sim": [
+    "src/core/preamble.js",
+    "src/core/physics.js",
+    "src/control/ik.js",
+    "src/rig/mech.js",
+    "src/rig/atst.js",
+    "src/control/posture.js",
+    "src/control/balance.js",
+    "src/control/cmg.js",
+    "src/control/dcm.js",
+    "src/control/gait.js",
+    "src/rig/presets.js",
+    "src/rig/derive.js"
+  ],
+  "ui": [
+    "src/ui/02-scene.js",
+    "src/ui/03-sim.js",
+    "src/ui/04-preset-ui.js",
+    "src/ui/05-telemetry-sheet.js",
+    "src/ui/06-twin-sticks.js",
+    "src/ui/07-camera-pad.js",
+    "src/ui/08-session-logging.js",
+    "src/ui/09-analytic-self-test.js",
+    "src/ui/10-camera.js",
+    "src/ui/11-loop.js"
+  ]
+}
