@@ -1,7 +1,6 @@
 # MK1.4 — status and handoff
 
-**Claude Opus 5 (1M context).** Supersedes `MK1-mech-project-notes-opus-5.md`, which
-describes the pre-yaw, pre-scaling physics and is wrong in most particulars.
+**Claude Opus 5 (1M context).**
 
 Live artifact: `mech-mk1-live-opus-5-1m.html`
 Served by: `node logserver.mjs 8080` → `http://<host>:8080/mech-mk1-live-opus-5-1m.html`
