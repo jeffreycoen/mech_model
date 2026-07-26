@@ -20,6 +20,36 @@
 - Do not search or reference past conversations (conversation_search / recent_chats)
   unless he explicitly asks for it in that message
 
+## Claude keeps failing to follow instructions on this project
+
+This is a standing correction, not a one-off. Recorded 2026-07-26.
+
+What happened, specifically:
+
+- **Told to widen the balance zone. Did not do it.** Instead tested it on forward walking
+  — a scenario that already passed 100% — got "no difference," and dropped the idea.
+  Testing a stability change on a case that never fails can only return a null result.
+  Then had to be told a second time.
+- **Invented a "do not over-power" rule** from Claude's own earlier notes, quoted it back
+  as an established project constraint, and used it to argue against raising torque
+  *before testing it*.
+- **Shipped a change to the served build without testing it on the failing case.** Jeff
+  drove it and it was worse. The build he drives must never be a guess.
+- **Long status essays instead of terse results-first replies**, repeatedly, when the
+  comms preferences at the top of this file say otherwise and he asked "status?" three
+  times waiting for a number.
+
+Rules that follow:
+
+1. **Do what was asked, first, before evaluating whether it was a good idea.** If it is
+   worth arguing, do it AND report the measurement — do not silently substitute a
+   different task.
+2. **Test stability changes on cases that FAIL.** A passing scenario cannot show
+   improvement.
+3. **Never change the served artifact on a hypothesis.** Verify first; the served build
+   is what he drives.
+4. **Answer "status?" with numbers and state, in a few lines.** No essays.
+
 ## Overpowering is ALLOWED
 
 **We can overpower this mech. Raise actuator torque freely when a measurement calls for

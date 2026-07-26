@@ -2262,6 +2262,10 @@ function deriveGait(rig){
        out 1.7 mm ABOVE its stance and it veered constantly. Cap at 95% of stance. */
     minFootSep:Math.min(foot.dim.z+0.06*(L/2.95),
                         1.9*Math.abs(rig.table.hipYawL.jp[2])),
+    /* BALANCED ZONE. How far the centre of pressure may travel under the foot before the
+       controller is out of authority -- i.e. how far off it may be and still be treated as
+       balanced. Was 0.60/0.45, so the machine balanced on a patch well inside the foot it
+       was standing on. Widened toward the real edge. */
     copLimitX:0.60*(foot.half.x-rig.ankle.x), copLimitZ:0.45*foot.half.z,
     copClamp:0.45*(L/2.95), travelRate:0.6*Math.sqrt(L/2.95),
     /* SCALE FIX: every TIME in the controller goes as sqrt(leg length). These were fixed
