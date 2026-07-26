@@ -1742,6 +1742,7 @@ class GaitController {
       centrePull: 0.18,     // how hard the footprint pair is pulled back onto its line
       plantPin: 0.22,      // lateral error corrected in the recorded print at touchdown
       turnEps: 4 * Math.PI / 180,   // heading error that justifies a step, rad
+      turnEpsHold: 14 * Math.PI / 180,  // wider band to LEAVE stand, so it settles
       yawPerStep: 20 * Math.PI / 180,  // most the body can turn in one step, rad
       minFootSep: 1.16,    // commanded lateral clearance between prints, m (foot width + air)
       travelRate: 0.06,    // m of per-step travel change per second of command
@@ -1783,7 +1784,15 @@ class GaitController {
      two sites that need it -- entering the walk and deciding to end it -- and only the
      first got the turn term, so a pure turn started and then closed itself out after a
      few steps with the heading still unreached. */
-  wantsMove() { return this.speedCmd() > this.moveEps() || this.yawCmd() > this.k.turnEps; }
+  wantsMove() {
+    /* Hysteresis. The machine delivers only ~4 deg of yaw per step and body yaw is
+       unregulated, so a bare 4 deg threshold is re-tripped by the residual the moment it
+       stands: close step -> STAND -> still off by more than turnEps -> walk again, for
+       ever. It never settles, and every extra shuffle re-rolls the dice on a fall.
+       Standing takes a wider band than starting does. */
+    const eps = this.standing ? this.k.turnEpsHold : this.k.turnEps;
+    return this.speedCmd() > this.moveEps() || this.yawCmd() > eps;
+  }
   /* SCALE FIX: the "is the stick pushed" threshold was an absolute 30 mm. A 1 ft rig has
      a total stride range of 58 mm, so more than half of the stick read as stopped. */
   moveEps() { return 0.01 * (this.rig.leg.thigh + this.rig.leg.shin); }
@@ -1941,7 +1950,12 @@ class GaitController {
   update(st, dt) {
     if (!this.plant) this.init(st);
     this.slew(dt);
-    this.balance.facing = this.active.facing;
+    /* MEASURED yaw, not the commanded frame. `active.facing` is latched at step
+       boundaries and is allowed to lead measured yaw by a full yawPerStep (20 deg); the
+       ankle axes follow the BODY. At a 20 deg mismatch about a third of the fore/aft CoP
+       error is injected into the lateral ankle and back -- a persistent mis-projection
+       during exactly the manoeuvre that still falls. */
+    this.balance.facing = this.bodyYaw();
     if (!this.k.enabled || !st.support) { this.balance.update(st, dt); return; }
     this.t += dt;
 

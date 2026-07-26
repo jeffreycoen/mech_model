@@ -57,9 +57,27 @@ and `1.45 · W · copLimitZ`.
 ANGLE. An inertia-based law (`kp = ωₙ²I`) was tried and measured strictly worse — 0/3 on
 two rigs where this form is 3/3 — because it lets the saturation angle vary per joint.
 
-**Do not over-power.** Actuator torque above what the load requires is destabilising,
-measured three separate ways (half-mass at full torque tore; Scout at ×2 torque failed;
-Overdriven dismantles itself).
+**WE CAN OVERPOWER THIS MECH — RETRACTED CLAIM.** This section previously read "do not
+over-power: actuator torque above what the load requires is destabilising," citing three
+measurements (half-mass at full torque tore; Scout at ×2 torque failed; Overdriven
+dismantles itself). **Do not trust that.** It was written by Claude, not by Jeff, and it
+was then quoted back as if it were an established project constraint — it was used to
+argue AGAINST raising torque before testing, which is exactly backwards.
+
+Why it does not hold:
+- All three cited measurements predate the world-frame CoP bug, the unrotated
+  `comToPelvis` bug, and the scale bugs. A machine falling for other reasons looks like
+  one destabilised by torque.
+- The one result that survives is narrower and is about STIFFNESS, not ceiling: servo
+  gains ×2 and ×4 measured worse at every gait timing (2026-07-26). `kp` and `tauMax`
+  are different knobs; conflating them was the error.
+- Measured 2026-07-26: five of six leg joints saturate at **100%** of available torque
+  during single support, and stance-foot load falls to **2% of body weight**. The legs
+  are UNDER-powered, not over-powered. The mech cannot stand on one leg.
+
+Design intent (Jeff): **either leg should hold the whole body at any time, like a human
+standing on one leg.** Size the legs for that, and raise torque freely when the
+measurement calls for it.
 
 Solver: 10 substeps × 8 iterations. Iterations must rise with chain length — the yaw ring
 made each leg an 8-link chain and 6 iterations walks in place but falls when travelling.
