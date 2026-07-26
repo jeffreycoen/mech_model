@@ -1408,7 +1408,11 @@ class CMG {
     this.kp = o.kp ?? 150e3;             // N.m per rad of lean
     this.kd = o.kd ?? 42e3;              // N.m per rad/s
     this.desat = o.desat ?? 7.0;         // s, momentum bleed time constant
-    this.yawDamp = o.yawDamp ?? 0.5;     // yaw rate damping, as a fraction of kd
+    this.yawDamp = o.yawDamp ?? 0.5;     // yaw rate damping, fraction of kd
+    /* 0.30, swept: 135 deg turn in 4.2 s vs 13.3 s at 0.03, and forward travel IMPROVES
+       (4.68 m vs 4.51 m per 25 s) rather than regressing. Before this session a turn
+       command never rotated the machine at all. */
+    this.yawGain = o.yawGain ?? 0.30;   // yaw steering authority, fraction of kp
     /* IDEAL MODE: full-authority attitude assist. No momentum store, no saturation,
        and it also servos yaw onto the commanded facing. Not physical hardware any
        more -- the stated goal is a tabletop bot that only falls when the maneuver is
@@ -1430,7 +1434,7 @@ class CMG {
       const f = qrot(this.body.q, V(1, 0, 0));
       let e = this.targetYaw - Math.atan2(-f.z, f.x);
       while (e > Math.PI) e -= 2 * Math.PI; while (e < -Math.PI) e += 2 * Math.PI;
-      yawT = this.kp * 0.03 * e + this.kd * 0.5 * -st.torsoRate.y;
+      yawT = this.kp * this.yawGain * e + this.kd * 0.5 * -st.torsoRate.y;
     }
     let t = V(this.kp * st.lean.roll + this.kd * rollRate, yawT,
               this.kp * st.lean.pitch + this.kd * pitchRate);
@@ -1737,6 +1741,8 @@ class GaitController {
       lateralCorrect: 0.22, // lateral error corrected in the commanded swing target
       centrePull: 0.18,     // how hard the footprint pair is pulled back onto its line
       plantPin: 0.22,      // lateral error corrected in the recorded print at touchdown
+      turnEps: 4 * Math.PI / 180,   // heading error that justifies a step, rad
+      yawPerStep: 20 * Math.PI / 180,  // most the body can turn in one step, rad
       minFootSep: 1.16,    // commanded lateral clearance between prints, m (foot width + air)
       travelRate: 0.06,    // m of per-step travel change per second of command
       turnRate: 4 * Math.PI / 180,  // rad/s of facing change
@@ -1768,6 +1774,16 @@ class GaitController {
 
   /* magnitude of the commanded per-step travel, m */
   speedCmd() { return Math.hypot(this.want.tx, this.want.tz); }
+  /* Yaw error between where the FEET are pointed and where the stick wants to face.
+     Turning is a stepping manoeuvre -- the feet are planted, so the only way to rotate
+     the machine is to pick one up and set it down rotated. */
+  bodyYaw() { const f = qrot(this.rig.bodies.torso.q, V(1, 0, 0)); return Math.atan2(-f.z, f.x); }
+  yawCmd() { return Math.abs(wrapPi(this.want.facing - this.bodyYaw())); }
+  /* ONE predicate for "the driver wants something". It was written out separately at the
+     two sites that need it -- entering the walk and deciding to end it -- and only the
+     first got the turn term, so a pure turn started and then closed itself out after a
+     few steps with the heading still unreached. */
+  wantsMove() { return this.speedCmd() > this.moveEps() || this.yawCmd() > this.k.turnEps; }
   /* SCALE FIX: the "is the stick pushed" threshold was an absolute 30 mm. A 1 ft rig has
      a total stride range of 58 mm, so more than half of the stick read as stopped. */
   moveEps() { return 0.01 * (this.rig.leg.thigh + this.rig.leg.shin); }
@@ -1781,6 +1797,21 @@ class GaitController {
     const dh = this.k.turnRate * dt;
     const eh = wrapPi(this.want.facing - this.cmd.facing);
     this.cmd.facing += Math.max(-dh, Math.min(dh, eh));
+    /* The feet only rotate when one is picked up and set down turned, so the commanded
+       frame must never lead the PLANTED feet by more than a single step's worth of yaw.
+       Without this the command races to the target, the controller reads itself as
+       aligned and stops after two steps while the machine still points the old way --
+       measured at 3x, 5x and 8x turn rate. This one constraint also replaces turn-rate
+       tuning: the per-step cap is the real limiter. */
+    /* Cap against MEASURED body yaw, not against another command. The machine delivers
+       only about a quarter of the yaw it is told to per step, so capping command-against-
+       command let the commanded frame run four steps ahead of where the mech physically
+       pointed -- and every placement rule works in that frame. Capping against reality
+       makes the command wait for the body. */
+    const by = this.bodyYaw(), cap = this.k.yawPerStep;
+    const lead = wrapPi(this.cmd.facing - by);
+    if (lead > cap) this.cmd.facing = by + cap;
+    else if (lead < -cap) this.cmd.facing = by - cap;
   }
 
   latch() { this.active = { tx: this.cmd.tx, tz: this.cmd.tz, facing: this.cmd.facing }; }
@@ -1933,7 +1964,11 @@ class GaitController {
     // and "stop" only meant "take zero-length steps". Standing is now a real state: both
     // feet stay planted and only the balance loop runs. It is entered at a touchdown so
     // we never freeze mid-swing, and left as soon as a command arrives.
-    const wantMove = this.speedCmd() > this.moveEps();
+    /* FIX: this tested TRAVEL only, so a pure turn command never left STAND -- the mech
+       stood still and the heading never changed. Measured: 2 steps in 25 s and the target
+       heading never reached, at 1x, 3x, 5x and 8x turn rate. Turning in place had been
+       recorded as "clean" purely because standing still cannot fall over. */
+    const wantMove = this.wantsMove();
     if (wantMove && this.stopping) this.stopping = false;   // stick came back mid-close
     if (this.standing) {
       if (wantMove) { this.standing = false; this._fromStand = true; this.rebuild(st); this._fromStand = false; }
@@ -2004,7 +2039,7 @@ class GaitController {
          Instead, take one CLOSING step that brings the trailing foot alongside the stance
          foot, then stand. */
       if (this.stopping) { this.stopping = false; this.standing = true; this.state = 'STAND'; }
-      else if (this.speedCmd() <= this.moveEps()) {
+      else if (!this.wantsMove()) {
         if (this.k.closeOnStop) { this.stopping = true; this.closeStep(st); }
         else { this.standing = true; this.state = 'STAND'; }
       }
@@ -2184,11 +2219,24 @@ function scaleRig(w,rig,s){
 /* Gait parameters that follow from size alone -- the dimensionless constants measured
    across MK1 (leg 2.95 m) and the Scout (leg 5.00 m). Scaling a rig therefore needs no
    retuning: these fall out of the geometry. */
+let YPS_DEG=20;
 function deriveGait(rig){
   const st=rigStats(rig), L=rig.leg.thigh+rig.leg.shin, z=Math.max(1e-4,st.com.y);
   const rt=Math.sqrt(L/2.95);
   const omega=Math.sqrt(9.81/z), foot=rig.bodies.footL;
-  return { tSS:1.66/omega, tDS:0.92/omega,
+  /* AGILITY. The 1.66/0.92 coefficients are the PASSIVE pendulum values -- what a machine
+     must obey if gravity is its only stabiliser. With attitude assist it does not have to.
+     Measured sweep at 1.25 m, 25 s forward, no falls in any cell: 1.0 -> 3.28 m, 0.7 ->
+     4.56 m, 0.5 -> 3.71 m. 0.7 is the peak; below it the steps stop paying for themselves.
+     Servo gains were swept in the same run and are strictly WORSE stiffer (x2 and x4 both
+     lose ground at every timing), so that lever stays alone -- matching the over-power
+     rule already in the design table. */
+  const AG=0.7;
+  const tSS=1.66*AG/omega, tDS=0.92*AG/omega;
+  /* Turning is now ONE parameter, not two: how far the body may turn per step. The slew
+     rate follows from it and the step cycle, so they cannot disagree. */
+  const yawPerStep=(YPS_DEG*Math.PI/180);
+  return { tSS, tDS, yawPerStep, 
     stepHeight:0.047*L, pelvisDrop:0.085*L,
     /* 0.28, not the 0.32 measured earlier: that figure was calibrated against a planner
        whose pendulum height was being clamped by the old 1.0 m floor. With the floor gone
@@ -2205,8 +2253,8 @@ function deriveGait(rig){
     /* SCALE FIX: every TIME in the controller goes as sqrt(leg length). These were fixed
        seconds, so a 1 ft rig spent 10.4 pendulum periods crouching where a full-size one
        spent 5, and its plan phases were similarly out of proportion. */
-    settleTime:0.4*rt, crouchTime:1.4*rt, tStart:1.2*rt, tEnd:3.0*rt,
-    turnRate:(8*Math.PI/180)*Math.sqrt(2.95/L), omega, L, height:st.height };
+    settleTime:0.4*rt*AG, crouchTime:1.4*rt*AG, tStart:1.2*rt*AG, tEnd:3.0*rt*AG,
+    turnRate:yawPerStep/(tSS+tDS), omega, L, height:st.height };
 }
 
 /* ---------- scene ---------- */

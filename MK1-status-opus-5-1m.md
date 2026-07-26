@@ -139,6 +139,43 @@ snaps at full speed every 5 s) survived 40 s with zero breaks; single-turn-then-
 falls sometimes (10-22 s, single runs, chaotic). Footstep-commit-at-liftoff was tried and
 reverted: it desyncs feet from the DCM plan during command ramps.
 
+## 4c. Agility round — "nimble, not bumbling"
+
+**Turning was a NO-OP, not a stability problem.** A turn command never rotated the
+machine at all: 2 steps in 25 s and the heading never reached, at 1x/3x/5x/8x turn rate.
+It had been recorded as "turn-in-place is clean" because standing still cannot fall over.
+Three defects, all the same class — a rule implemented at two sites and updated at one:
+
+1. `wantMove` tested TRAVEL only, so a pure turn never left STAND.
+2. A SECOND travel-only gate at touchdown closed the walk out after a few steps.
+   Both now call one predicate, `wantsMove()`.
+3. "Am I aligned?" was measured against the controller's own command, which slews faster
+   than the body turns — so it declared victory while still pointing the old way. The
+   gate now reads MEASURED body yaw (`bodyYaw()`), and the commanded frame may not lead
+   measured yaw by more than `yawPerStep`. That cap replaces turn-rate tuning outright:
+   `turnRate = yawPerStep / (tSS + tDS)`, one parameter instead of two that can disagree.
+
+**Measured (1.25 m, ensembles not run — single 25-40 s runs):**
+
+| lever | finding |
+|---|---|
+| gait time x0.7 (`AG`) | 4.56 m vs 3.28 m per 25 s. 0.5 is worse than 0.7. No falls in any cell. |
+| servo gain x2, x4 | strictly WORSE at every timing — lever left alone, matches the over-power rule |
+| CMG `yawGain` 0.03 -> 0.30 | 135 deg turn 13.3 s -> 4.2 s AND forward travel improves 4.51 -> 4.68 m |
+| `yawGain` 0.6 / 1.0 | turn 3.4 s / 3.3 s, forward flat. NOT battery-verified; 0.30 is shipped. |
+
+Body delivers only ~4 deg of yaw per step against foot friction regardless of command —
+that physical limit is why the assist, not the planner, is the lever that worked.
+
+**Battery after (40 s each, single runs):** diagonal turn-and-walk — the case that failed
+all session — now survives with ZERO breaks (was falling at 4.7-16 s). Forward 7.58 m, up
+from 5.35 m. Strafe clean. Still falling: reverse-180 at 12.6 s, extreme box-drive at
+21.1 s — both large heading reversals.
+
+**Process note:** `sim.mjs` silently diverged from the artifact mid-session and a whole
+sweep ran against stale code. Verify parity by grepping BOTH files for each change before
+trusting a sweep, not just that the run exited 0.
+
 ## 5. Open items, ranked
 
 1. **Body yaw is unregulated.** The hip yaw rings are commanded flat, so the feet track
