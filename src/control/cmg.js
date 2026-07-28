@@ -23,9 +23,52 @@ class CMG {
     this.body = o.body;
     this.tauMax = o.tauMax ?? 45e3;      // N.m
     this.hMax = o.hMax ?? 2.2e4;         // N.m.s of stored momentum
+    /* SPINNING ROTOR -- the passive half of a flywheel, which this class never had.
+       Everything else here is an ACTIVE torque source: a control law reads attitude and
+       commands a torque. A real flywheel also does something with no control law at all --
+       it stores angular momentum, and any attempt to tilt the body it is bolted into
+       produces a gyroscopic reaction torque -tau = -omega x h automatically, at zero
+       latency. That cannot over-react, overshoot or oscillate, because it is not a
+       controller; it is the same physics that keeps a spinning top up.
+
+       It was worth adding because the machine's complaint is speed, not weakness: it peaks
+       at 1.18 m/s and 1.6 g while the ACTIVE loop already rails at 100% for 11-24% of
+       driving. More active authority makes a proportional-on-lean law slam harder. Stored
+       momentum instead resists RATE of attitude change, which is the actual problem.
+
+       hMax was already the right order for this and was doing nothing: `ideal` mode skips
+       the whole momentum store, so the flywheel's momentum has never had any effect on the
+       machine. At the shipped hMax the passive torque at 1 rad/s of tilt is 0.25-0.57x the
+       gravity torque tipping the rig at a 5 deg lean; ROTOR_SPIN carries it past 1x, which
+       is spinning the same wheel faster rather than making it heavier. */
+    /* rotorSpin 0 -- OFF. The implicit integration works: the runaway is gone and the
+       passive term stays bounded at 34-268% of the actuator ceiling instead of reaching
+       173 840%. It just does not help. Driven at MK1.8.0 the fall rate did not improve,
+       and a rotor that contributes torque comparable to the whole actuator during normal
+       walking while buying nothing is mass and noise. Safe at any value now if it is ever
+       worth revisiting; the integration fix in physics.js stands on its own and is what
+       actually needed doing. */
+    this.hRotor = o.hRotor ?? (o.hMax ?? 2.2e4) * (o.rotorSpin ?? 0);
     this.kp = o.kp ?? 150e3;             // N.m per rad of lean
     this.kd = o.kd ?? 42e3;              // N.m per rad/s
     this.desat = o.desat ?? 7.0;         // s, momentum bleed time constant
+    /* SLEW LIMIT on commanded torque. Every command channel on this machine is rate-limited
+       without exception -- travel, facing, the waist ring, the pelvis -- and the gyro was
+       the one that was not. It could go from nothing to its full ceiling in a single frame,
+       which is what "moves very fast, almost jumping around" measures: 1.18 m/s on a 300 mm
+       machine, 1.6 g of lateral acceleration, and the actuator pinned at 100% for 11-24% of
+       driving.
+
+       The rate is DERIVED, not chosen: full authority in one step period divided by
+       `slewSteps`. Tying it to the gait means it is Froude-correct for free (tauMax goes as
+       s^4, the step period as sqrt(s), so the rate goes as s^3.5) and it means the
+       stabiliser answers a disturbance on the same timescale the machine moves on --
+       slightly faster than it walks, not instantly.
+       stepPeriod is handed over from deriveGait by rig/build.js rather than re-derived
+       here; the fallback only exists so the class is constructible standalone. */
+    this.stepPeriod = o.stepPeriod ?? 0.5;
+    this.slewSteps = o.slewSteps ?? 1.5;    // full ceiling in stepPeriod/slewSteps seconds
+    this.tauCmd = V();
     this.yawDamp = o.yawDamp ?? 0.5;     // yaw rate damping, fraction of kd
     /* 0.30, swept: 135 deg turn in 4.2 s vs 13.3 s at 0.03, and forward travel IMPROVES
        (4.68 m vs 4.51 m per 25 s) rather than regressing. Before this session a turn
@@ -36,10 +79,32 @@ class CMG {
        more -- the stated goal is a tabletop bot that only falls when the maneuver is
        extreme, so the stabiliser is allowed to be as good as the fiction needs. */
     this.ideal = o.ideal !== false;
+    /* CAPTURE-POINT ATTITUDE -- OFF BY DEFAULT, and it should stay off. Tried at MK1.6.0
+       and it fell all three rigs within ~1 s of the stick being touched, every time, while
+       standing was the calmest ever logged (capErr 0.2 mm, gyro 1%, up 1.000).
+
+       Why it fails, and it is not a tuning problem: the lean term is an ATTITUDE error
+       driving an ATTITUDE actuator. Capture point is a POSITION error. Feeding it to a
+       torque actuator puts an extra integrator in the loop -- the gyro tilts the body, the
+       tilt moves the COM, the moving COM grows the capture error -- so it is quiet at rest
+       where the error is zero and diverges as soon as anything moves. Measured escalation
+       on the Light Frame: capErr 13.5 -> 29 -> 116 -> 179 mm over 1.0 s, gyro pinned at
+       100%, up 1.000 -> 0.703, torso and both arm mounts torn.
+       The gain conversion was wrong too. kp/h assumed the error would be about lean*h; a
+       real walk carries tens of mm of DCM tracking error, which at h = 0.19 m is 6x the
+       old torque at 40 mm and 27x at 179 mm.
+
+       The ankles are where prediction belongs and they already have it: CoP is a POSITION,
+       so a position error commanding a position is the correct pairing (balance.js:140).
+       Kept behind a flag rather than deleted, because the measurement is worth more than
+       the code and this is the cheapest way to keep both. */
+    this.predictive = o.predictive === true;
+    this.capErr = 0;
+    this.copRef = null;
     this.targetYaw = undefined;
     this.H = V(); this.tau = V();
     this.enabled = o.enabled !== false;
-    this.satFrac = 0; this.tauFrac = 0;
+    this.satFrac = 0; this.tauFrac = 0; this.gyroTau = 0;
   }
   update(st, dt) {
     if (!this.enabled || !this.body) { if (this.body) this.body.tExt = V(); this.tau = V(); return; }
@@ -47,15 +112,70 @@ class CMG {
     // +Z, so the corrective torque about +Z is positive for a positive pitch lean, and the
     // rate term uses -omega rather than raw body rate or the damping becomes anti-damping.
     const pitchRate = -st.torsoRate.z, rollRate = -st.torsoRate.x;
-    let yawT = this.kd * this.yawDamp * -st.torsoRate.y;
+    /* Yaw is measured on the CHASSIS, not on the body this thing is bolted into. Once the
+       torso yaws on a waist ring it is a turret, and a stabiliser that reads turret yaw
+       spends its authority braking the aim instead of holding the machine's heading.
+       Roll and pitch still come from the torso -- the waist frees yaw only. */
+    const yawRate = st.pelvisRate ? st.pelvisRate.y : st.torsoRate.y;
+    let yawT = this.kd * this.yawDamp * -yawRate;
     if (this.ideal && this.targetYaw !== undefined) {
-      const f = qrot(this.body.q, V(1, 0, 0));
-      let e = this.targetYaw - Math.atan2(-f.z, f.x);
+      let cur;
+      if (st.pelvisYaw !== undefined) cur = st.pelvisYaw;
+      else { const f = qrot(this.body.q, V(1, 0, 0)); cur = Math.atan2(-f.z, f.x); }
+      let e = this.targetYaw - cur;
       while (e > Math.PI) e -= 2 * Math.PI; while (e < -Math.PI) e += 2 * Math.PI;
-      yawT = this.kp * this.yawGain * e + this.kd * 0.5 * -st.torsoRate.y;
+      yawT = this.kp * this.yawGain * e + this.kd * 0.5 * -yawRate;
     }
-    let t = V(this.kp * st.lean.roll + this.kd * rollRate, yawT,
-              this.kp * st.lean.pitch + this.kd * pitchRate);
+    /* PREDICTIVE ATTITUDE. The proportional term used to read st.lean -- where the body IS
+       tilted, right now. That is the fastest and strongest actuator on the machine
+       responding to a position error with no notion of where the mass is heading, so a
+       lean that was already recovering got hit just as hard as one that was diverging: it
+       slams, overshoots, sees the opposite lean, slams back. Measured over 38 s of driving
+       at MK1.5.1: pelvis peaks of 1 179 mm/s on a 300 mm machine -- four body-heights per
+       second -- 1.6 g of lateral acceleration, and the gyro pinned at its ceiling 11-24% of
+       the time.
+
+       The ankles have never worked this way. balance.js computes the LIPM capture point,
+       xi = com + comVel/omega -- "where the COM comes to rest if we do nothing" -- and
+       drives the CoP to it. This is the same quantity, on the actuator that needed it most.
+       A body leaning forward but decelerating fast enough has xi behind the support and now
+       gets no torque at all, which is most of the thrashing.
+
+       GAIN CONVERSION, not a new number: kp is N.m per RAD of lean and the error is now in
+       METRES, and a lean of theta puts the COM theta*h off its support, so kp/h is the same
+       authority for the same geometric displacement. Nothing here changes how hard the gyro
+       can push -- only what it pushes about. Authority and ideal mode are deliberately
+       untouched so this can be judged on its own.
+
+       Airborne (no support polygon) there is no capture point to speak of, so it falls back
+       to lean -- attitude control matters most with a foot in the air. */
+    let eRoll = st.lean.roll, ePitch = st.lean.pitch, kpEff = this.kp;
+    if (this.predictive && st.support && st.comVel) {
+      const h = Math.max(1e-4, st.comHeight ?? st.comHeightRaw);
+      const w0 = Math.sqrt(G / h);
+      /* REFERENCE POINT. Not the support centre. During a normal walk the capture point is
+         SUPPOSED to sit ahead of the feet -- that is what walking is -- so measuring against
+         the support centre would have the gyro applying a large braking torque throughout
+         every step, fighting the gait instead of the imbalance. At a walking speed of
+         100 mm/s and omega ~7 rad/s the capture point leads by ~14 mm, which through kp/h
+         is roughly 3x the torque the old lean term produced. That is not a stabiliser, it
+         is a handbrake.
+         balance.js does not have this problem because it tracks the planner's ZMP
+         (copOverride) rather than the support centre, and falls back to the support centre
+         only when no plan exists. `copRef` is that same reference, handed over by the loop,
+         so the gyro's error is "how far is the capture point from where the plan says it
+         should be" -- zero through a nominal walk, non-zero only on real imbalance. */
+      const refX = this.copRef ? this.copRef.x : st.support.x;
+      const refZ = this.copRef ? this.copRef.z : st.support.z;
+      // eX is toward +X and pairs with lean.pitch; eZ is toward +Z and pairs with
+      // lean.roll -- same sign convention, so this is a substitution, not a re-derivation.
+      ePitch = (st.com.x + st.comVel.x / w0) - refX;
+      eRoll  = (st.com.z + st.comVel.z / w0) - refZ;
+      kpEff = this.kp / h;
+      this.capErr = Math.hypot(ePitch, eRoll);
+    } else this.capErr = 0;
+    let t = V(kpEff * eRoll + this.kd * rollRate, yawT,
+              kpEff * ePitch + this.kd * pitchRate);
     const cap = this.tauMax;
     const m = vlen(t);
     if (m > cap) t = vmul(t, cap / m);
@@ -72,6 +192,52 @@ class CMG {
       const hn2 = vlen(this.H);
       if (hn2 > this.hMax) this.H = vmul(this.H, this.hMax / hn2);
     }
+    /* Slew the COMMANDED torque. Applied after the ceiling clamp and after saturation, so
+       the limit is on how fast the drive can change its output, which is what a real
+       gimbal or wheel drive is limited by. */
+    {
+      const dr = this.tauMax * (this.slewSteps / Math.max(1e-6, this.stepPeriod)) * dt;
+      const d = vsub(t, this.tauCmd), dn = vlen(d);
+      t = (dn > dr && dn > 0) ? vadd(this.tauCmd, vmul(d, dr / dn)) : t;
+      this.tauCmd = t;
+    }
+    /* Gyroscopic reaction, applied OUTSIDE the actuator ceiling. tauMax is what the drive
+       motor can command; this is not commanded by anything -- it is the reaction the mount
+       feels because the rotor's momentum vector is being carried around by a rotating body.
+       Capping it at tauMax would be capping physics. */
+    /* PRECESSION STABILITY -- why this ships at zero.
+       tau = -omega x h does zero work and cannot add energy in continuous time; that was
+       verified exactly (0.0e+0) before it shipped. It is integrated EXPLICITLY, though --
+       physics.js reads omega at the start of the substep -- and explicit Euler on a pure
+       precession term does not precess, it spirals outward. Growth per substep is
+       sqrt(1 + (h*dt/I)^2), so it needs h*dt/I << 1. Measured as shipped at MK1.7.0:
+
+         rig     mount    I_min      h*dt/I   growth/substep   growth/second
+         light   torso    1.05e-4     0.89        1.336           3.8e+305
+         atst    pelvis   6.17e-5     0.41        1.081           3.1e+100
+         atat    pelvis   1.87e-3     0.03        1.000           3.9
+
+       which is exactly the order the rigs failed in when driven: the Light Frame blew
+       apart in 0.7 s with the passive term reaching 173 840% of the actuator ceiling while
+       the ACTIVE loop sat at 4-9% and its slew limit worked perfectly. Scout fell at 10-15 s,
+       Heavy at 9 s.
+
+       This is the same defect as the servo damping term, which is also explicit (`wRel`
+       frozen across the substep) and cost this project a night. Same shape, different term.
+
+       The stable ceiling, h <= 0.045*I/dt, is 20x below the shipped value on the Light
+       Frame and 9x below on the Scout -- so a rotor small enough to integrate stably here
+       is too small to be worth carrying. Fixing it properly means solving
+       (I - dt*[h]x) * omega_new = I * omega_old in the integrator, which is unconditionally
+       stable and lets h be as large as the fiction wants. That is a solver change and has
+       not been made. */
+    /* The rotor is handed to the INTEGRATOR, not applied as a torque here. See the
+       h_rotor note in physics.js integrate(): as an external torque this term is explicit
+       and detonates; inside the implicit Newton step it is unconditionally stable and
+       |omega| is non-increasing by construction. */
+    this.body.hRotor = this.hRotor;
+    // Telemetry only -- the magnitude the rotor is contributing, |omega x h|.
+    this.gyroTau = this.hRotor > 0 ? vlen(vcross(this.body.w, qrot(this.body.q, V(0, this.hRotor, 0)))) : 0;
     this.tau = t;
     this.tauFrac = vlen(t) / cap;
     this.satFrac = this.ideal ? 0 : vlen(this.H) / this.hMax;
@@ -80,121 +246,22 @@ class CMG {
 }
 
 /* Fit a CMG to an assembled rig. The flywheel assembly is real mass bolted into the
-   torso, so it is added there and the inertia scaled with it. */
+   chosen body, so it is added there and the inertia scaled with it.
+
+   MOUNT. This defaulted to `torso` and was hardcoded, which is right for the bipeds --
+   their torso IS the hull, 4 200 kg of it. It is wrong for the Heavy Walker, whose
+   `torso` is a 420 kg NECK RING carrying the head: the hull is `pelvis` at 9 400 kg. A
+   gyro bolted to the neck would have been reacting against a body 22x lighter than the
+   machine, through a hinge that is free in yaw -- so the yaw channel would have spun the
+   head and delivered nothing to the chassis. Roll and pitch would have transmitted (the
+   ring frees yaw alone) but through a 26 kN.m hinge that the flywheel outweighs.
+   Pass `mount` to put it on the body that actually is the machine. */
 function fitCMG(rig, o = {}) {
-  const b = rig.bodies.torso;
+  const b = rig.bodies[o.mount || 'torso'];
+  if (!b) throw new Error(`fitCMG: no body '${o.mount || 'torso'}' to mount to`);
   const mass = o.mass ?? 180;
   const k = (b.mass + mass) / b.mass;
   b.mass += mass; b.invMass = 1 / b.mass;
   b.I = b.I.map((v) => v * k); b.invI = m3inv(b.I);
   return new CMG(Object.assign({ body: b }, o));
-}
-
-class BalanceController {
-  constructor(rig, cfg = {}) {
-    this.rig = rig;
-    this.k = Object.assign({
-      ankleKp: 0.03, ankleKd: 0.011,     // capture-point error (m) -> ankle angle (rad)
-      ankleTrim: 0.16,                   // max ankle trim, rad
-      signPitch: 1, signRoll: 1, signHip: 1,
-      kCop: 0.6,             // CoP error (m) -> ankle torque, as a fraction of F
-      copLimitX: 0.36, copLimitZ: 0.24,  // CoP travel from the ankle pivot, m (foot geometry)
-      hipStrategy: 0.0,                  // rad of hip trim per m of capture-point excess
-      lateralShift: 0.0,                 // rad of hip roll per m of lateral capture error
-      capture: 1.6,
-      torsoKp: 26e3, torsoKd: 7.0e3,     // torso attitude, N.m / rad
-      hipKp: 0.08, hipKd: 0.024,         // hip angle servo trim (rad per rad of lean)
-      hipTrimLimit: 0.35,
-      kneeTarget: 18 * Math.PI / 180,
-      comHeightTarget: null,
-      kneeKp: 1.4, kneeKd: 0.10,
-    }, cfg);
-    this.stance = { hip: -9 * Math.PI / 180, knee: 18 * Math.PI / 180, ankle: -9 * Math.PI / 180 };
-    // All joints stay in position mode. Balance is applied as small angle trims on top
-    // of a stance that is known to hold statically; commanding ankle TORQUE directly
-    // makes the ankle a free pivot on any frame where contact force reads low, and the
-    // legs fold before the loop can engage.
-    this.debug = {};
-  }
-
-  update(st, dt) {
-    const J = this.rig.joints;
-    if (!st.support) {                       // airborne: hold the stance pose
-      return;
-    }
-
-    // --- capture point (LIPM): where the COM will come to rest if we do nothing ---
-    // SCALE FIX: absolute 0.5 m floor; bound at 2 ft and below.
-    const hCom = Math.max(1e-4, st.com.y);
-    const w0 = Math.sqrt(G / hCom);
-    const xiX = st.com.x + st.comVel.x / w0;
-    const xiZ = st.com.z + st.comVel.z / w0;
-
-    const eX = (xiX - st.support.x), eZ = (xiZ - st.support.z);
-
-    // --- desired centre of pressure ---------------------------------------------------
-    // Default: drive the capture point back to the support centre. When a gait planner
-    // supplies copOverride, track that instead -- it already encodes a dynamically
-    // feasible ZMP plus DCM error feedback.
-    const copDesX = this.copOverride ? this.copOverride.x : xiX + this.k.capture * eX;
-    const copDesZ = this.copOverride ? this.copOverride.z : xiZ + this.k.capture * eZ;
-
-    const nSupport = (st.feet.L.contact ? 1 : 0) + (st.feet.R.contact ? 1 : 0);
-    // --- ankles: hold the stance pose on PD, bias the torque to move the MEASURED CoP.
-    // Closing on measured CoP rather than commanding open-loop torque means the loop is
-    // robust to whatever the servo happens to be doing.
-    for (const s of ['L', 'R']) {
-      const f = st.feet[s];
-      const aJ = J[`ankleYoke${s}`], rJ = J[`foot${s}`];
-      aJ.target = this.stance.ankle;
-      rJ.target = 0;
-      if (!f.contact || !f.cop) { aJ.tauFF = 0; rJ.tauFF = 0; continue; }
-      /* FRAME FIX: the ankle's pitch and roll axes turn with the body, so the CoP error
-         must be projected into the FOOT frame before it becomes joint torque. Applied in
-         world axes this loop is exact at facing 0 and reversed at facing 135 -- which is
-         why every walk after a turn fell over while cold-start walking was fine. */
-      const ch = Math.cos(this.facing || 0), sh = Math.sin(this.facing || 0);
-      const rdX = copDesX - f.ankle.x, rdZ = copDesZ - f.ankle.z;
-      const dDesF = clamp(rdX * ch - rdZ * sh, -this.k.copLimitX, this.k.copLimitX);
-      const dDesL = clamp(rdX * sh + rdZ * ch, -this.k.copLimitZ, this.k.copLimitZ);
-      const rcX = f.cop.x - f.ankle.x, rcZ = f.cop.z - f.ankle.z;
-      const errX = dDesF - (rcX * ch - rcZ * sh);
-      const errZ = dDesL - (rcX * sh + rcZ * ch);
-      aJ.tauFF = this.k.signPitch * -this.k.kCop * f.force * errX;
-      // In DOUBLE support the net lateral CoP is set by how load is shared between the
-      // feet, not by rolling either one. Commanding foot roll here just tips a foot onto
-      // its edge and sheds contact area, which is strictly destabilising. Ankle roll is
-      // only the right lever in single support.
-      rJ.tauFF = nSupport > 1 ? 0 : this.k.signRoll * this.k.kCop * f.force * errZ;
-    }
-
-    // --- hip strategy ---------------------------------------------------------------
-    // Ankle torque caps how far the CoP can travel: dxMax = tauMax / F. Past that the
-    // ankle is saturated and the only remaining authority is counter-rotating the trunk
-    // to generate centroidal angular momentum. Engage strictly on the excess.
-    // SCALE FIX: absolute 1 N floor is 10% of a 1 kg rig's weight.
-    const Fsum = Math.max(1e-3 * st.mass * G, st.totalContactForce);
-    const dxMax = (J.ankleYokeL.tauMax * 2) / Fsum;
-    const dzMax = (J.footL.tauMax * 2) / Fsum;
-    const exX = Math.sign(eX) * Math.max(0, Math.abs(eX) - dxMax);
-    const exZ = Math.sign(eZ) * Math.max(0, Math.abs(eZ) - dzMax);
-
-    // --- torso attitude held by the hips (position servo, trimmed by lean error) ---
-    // d(lean)/dt, not raw body rate: tipping forward (+X) is a NEGATIVE rotation about
-    // +Z, so feeding omega_z straight in makes the damping term anti-damping.
-    const pitchErr = st.lean.pitch, rollErr = st.lean.roll;
-    const pitchRate = -st.torsoRate.z, rollRate = -st.torsoRate.x;
-    const T = this.k.hipTrimLimit;
-    const hipPitchTrim = clamp(this.k.signHip * (this.k.hipKp * pitchErr + this.k.hipKd * pitchRate)
-                             + this.k.hipStrategy * exX, -T, T);
-    const hipRollTrim = clamp(this.k.signHip * (this.k.hipKp * rollErr + this.k.hipKd * rollRate)
-                            + this.k.hipStrategy * exZ + this.k.lateralShift * eZ, -T, T);
-
-    for (const s of ['L', 'R']) {
-      J[`thigh${s}`].target = this.stance.hip + hipPitchTrim;
-      J[`hipYoke${s}`].target = hipRollTrim;
-      J[`shin${s}`].target = this.stance.knee;
-    }
-    this.debug = { copDesX, copDesZ, xiX, xiZ, eX, eZ, hipPitchTrim, hipRollTrim, loaded: (st.feet.L.contact?1:0) + (st.feet.R.contact?1:0) };
-  }
 }

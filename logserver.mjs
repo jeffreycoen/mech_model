@@ -49,8 +49,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  /* `/` serves the NEWEST built artifact rather than a hardcoded name. The name now carries the
+     build version (see build.mjs artifactName), so hardcoding it here would be the two-site rule
+     again -- and a stale literal would 404 on every version bump. */
   let p = decodeURIComponent(url.pathname);
-  if (p === '/') p = '/mech-mk1-live-opus-5-1m.html';
+  if (p === '/') {
+    const arts = fs.readdirSync(ROOT).filter((f) => /^mech-.*\.html$/.test(f))
+      .map((f) => ({ f, m: fs.statSync(path.join(ROOT, f)).mtimeMs }))
+      .sort((a, b) => b.m - a.m);
+    if (!arts.length) { res.writeHead(404, { 'content-type': 'text/plain' }).end('no artifact built'); return; }
+    p = '/' + arts[0].f;
+  }
   const file = path.join(ROOT, path.normalize(p).replace(/^(\.\.[/\\])+/, ''));
   if (!file.startsWith(ROOT) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
     res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');

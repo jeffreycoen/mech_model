@@ -76,10 +76,6 @@ function qExp(v) {  // exponential map: rotation vector -> quat
 /* ---------------- inertia primitives (about own COM, local axes) ---------------- */
 const boxInertia = (m, w, h, d) =>
   m3diag(m * (h * h + d * d) / 12, m * (w * w + d * d) / 12, m * (w * w + h * h) / 12);
-// cylinder along +Y
-const cylInertiaY = (m, r, h) =>
-  m3diag(m * (3 * r * r + h * h) / 12, m * r * r / 2, m * (3 * r * r + h * h) / 12);
-const sphereInertia = (m, r) => m3diag(2 * m * r * r / 5, 2 * m * r * r / 5, 2 * m * r * r / 5);
 
 // Compose sub-parts into one rigid body's mass properties.
 // parts: [{mass, inertia:mat3 (about sub-COM, in sub frame), pos:vec3, quat?:quat}]
@@ -134,12 +130,10 @@ class Body {
     this.w = o.angVel || V();
     this.xp = this.x; this.qp = this.q;
     this.fExt = V(); this.tExt = V();
-    this.a = V(); this.alpha = V();     // COM accel / angular accel, updated per substep
-    this.detached = false;
+    this.hRotor = 0;   // stored flywheel momentum about local +Y, N.m.s
   }
   toWorld(p) { return vadd(this.x, qrot(this.q, p)); }
   dirWorld(d) { return qrot(this.q, d); }
-  pointVel(rWorld) { return vadd(this.v, vcross(this.w, rWorld)); }
   kinetic() {
     const wl = qrotInv(this.q, this.w);
     return 0.5 * this.mass * vlen2(this.v) + 0.5 * vdot(wl, m3mulv(this.I, wl));
@@ -169,7 +163,7 @@ function rotateBy(b, dwWorld, sign) {
 
 /* Positional correction. err = anchor2 - anchor1 (world). Bodies pulled together.
    Returns dlambda (>=0 when err>0). p = dlambda * n is the impulse applied to b1 (+) / b2 (-). */
-function solvePositional(b1, b2, r1, r2, err, compliance, h, lambda, maxLambda = Infinity) {
+function solvePositional(b1, b2, r1, r2, err, compliance, h, lambda) {
   const c = vlen(err);
   if (c < 1e-12) return { dl: 0, n: V() };
   const n = vmul(err, 1 / c);
@@ -177,8 +171,7 @@ function solvePositional(b1, b2, r1, r2, err, compliance, h, lambda, maxLambda =
   const wsum = w1 + w2;
   if (wsum < 1e-18) return { dl: 0, n };
   const a = compliance / (h * h);
-  let dl = (c - a * lambda) / (wsum + a);
-  if (lambda + dl > maxLambda) dl = maxLambda - lambda;
+  const dl = (c - a * lambda) / (wsum + a);
   if (dl === 0) return { dl: 0, n };
   const p = vmul(n, dl);
   if (b1.invMass) { b1.x = vadd(b1.x, vmul(p, b1.invMass)); rotateBy(b1, applyInvI(b1, vcross(r1, p)), +1); }
@@ -187,7 +180,7 @@ function solvePositional(b1, b2, r1, r2, err, compliance, h, lambda, maxLambda =
 }
 
 /* Angular correction. theta = rotation vector (world) to apply to b1 (+) / b2 (-). */
-function solveAngular(b1, b2, theta, compliance, h, lambda, maxLambda = Infinity) {
+function solveAngular(b1, b2, theta, compliance, h, lambda) {
   const c = vlen(theta);
   if (c < 1e-12) return { dl: 0, n: V() };
   const n = vmul(theta, 1 / c);
@@ -195,10 +188,7 @@ function solveAngular(b1, b2, theta, compliance, h, lambda, maxLambda = Infinity
   const wsum = w1 + w2;
   if (wsum < 1e-18) return { dl: 0, n };
   const a = compliance / (h * h);
-  let dl = (c - a * lambda) / (wsum + a);
-  const tot = lambda + dl;
-  if (tot > maxLambda) dl = maxLambda - lambda;
-  else if (tot < -maxLambda) dl = -maxLambda - lambda;
+  const dl = (c - a * lambda) / (wsum + a);
   if (dl === 0) return { dl: 0, n };
   const p = vmul(n, dl);
   if (b1.invMass) rotateBy(b1, applyInvI(b1, p), +1);
@@ -235,8 +225,6 @@ class Weld {
     this.compliance = o.compliance ?? 0;
     this.angCompliance = o.angCompliance ?? 0;
     this.broken = false;
-    this.damage = 0;
-    this.damageRate = o.damageRate ?? 0;         // 0 = no fatigue
     // telemetry (per substep, N and N.m)
     this.F = V(); this.T = V();
     this.util = 0; this.peakUtil = 0;
@@ -246,21 +234,11 @@ class Weld {
   solve(h) {
     if (this.broken) return;
     const { a, b } = this;
-    // angular first
+    // angular first. Same call Hinge.solve makes for the same job -- this was hand-inlined,
+    // and the copy still carried `al * 0`, the dead accumulated-multiplier term.
     const theta = orientationError(a, b, this.qRest);
-    if (vlen(theta) > 1e-12) {
-      const c = vlen(theta), n = vmul(theta, 1 / c);
-      const w1 = angInvMass(a, n), w2 = angInvMass(b, n);
-      const wsum = w1 + w2;
-      if (wsum > 1e-18) {
-        const al = this.angCompliance / (h * h);
-        const dl = (c - al * 0) / (wsum + al);
-        const p = vmul(n, dl);
-        if (a.invMass) rotateBy(a, applyInvI(a, p), +1);
-        if (b.invMass) rotateBy(b, applyInvI(b, p), -1);
-        this.la = vadd(this.la, p);
-      }
-    }
+    const ra = solveAngular(a, b, theta, this.angCompliance, h, 0);
+    if (ra.dl !== 0) this.la = vadd(this.la, vmul(ra.n, ra.dl));
     // positional (anchors recomputed AFTER the angular pass)
     const r1 = a.dirWorld(this.ra), r2 = b.dirWorld(this.rb);
     const err = vsub(vadd(b.x, r2), vadd(a.x, r1));
@@ -279,18 +257,9 @@ class Weld {
     const ta = vdot(this.T, nAx);
     this.Mt = ta;
     this.Mb = vlen(vsub(this.T, vmul(nAx, ta)));
-    const L = this.lim;
-    const tensionTerm = Math.max(0, this.Fax) / L.tension;   // compression does not pull the weld apart
-    const u2 =
-      tensionTerm * tensionTerm +
-      (this.Fsh / L.shear) ** 2 +
-      (this.Mb / L.bend) ** 2 +
-      (this.Mt / L.torsion) ** 2;
-    this.util = Math.sqrt(u2);
+    this.util = structuralUtil(this.lim, this.Fax, this.Fsh, this.Mb, this.Mt);
     if (this.util > this.peakUtil) this.peakUtil = this.util;
-    if (this.damageRate > 0 && this.util > 0.6) this.damage += (this.util - 0.6) * this.damageRate * h;
-    const effective = 1 - Math.min(0.9, this.damage);
-    if (this.util >= effective) { this.broken = true; this.brokeAtUtil = this.util; }
+    if (this.util >= 1) { this.broken = true; this.brokeAtUtil = this.util; }
   }
 }
 
@@ -315,9 +284,35 @@ class Hinge {
     // i.e. a stiff elastomeric bumper rather than an infinitely rigid wall.
     this.limitCompliance = o.limitCompliance ?? 1e-7;
     this.lLim = 0; this.tauLimit = 0; this.onStop = false;
-    this.angle = 0; this.tau = 0; this.tauCmd = 0; this.saturated = false;
+    this.angle = 0; this.tau = 0; this.saturated = false;
+    /* SERVO INTERNALS, exposed for the log. Both of these were function-locals inside solve()
+       and were computed 8 iterations x 10 substeps x every joint -- ~330 000 times a second on
+       the shipped rig -- and discarded every time, which is why no driving log could answer
+       "what was the actuator being asked for".
+         wRel      relative angular rate about the hinge axis, rad/s. The damping half of the
+                   servo is kd*wRel, and kd alone reaches the ceiling at 21-113 rad/s
+                   depending on the joint, so this term can BE the entire actuator output.
+         tauDemand the raw PD+feedforward demand BEFORE the tauMax clamp, N.m. satFrac says a
+                   joint was railed; only this says whether it wanted 1.05x its ceiling or 40x,
+                   and those have opposite remedies (raise the ceiling vs the command is wrong). */
+    this.wRel = 0; this.tauDemand = 0;
+    /* ACTUATOR GOVERNOR. Ceiling on how fast the OUTPUT TORQUE may change, N.m/s -- distinct from
+       tauMax, which caps how hard it can push. Infinity = ungoverned, the old behaviour.
+       Real hardware has this: current cannot step through an inductance and a gearbox has windup.
+       The gyro has modelled it since MK1.8 (`slewSteps`, full authority in stepPeriod/slewSteps)
+       and the joints did not, so every actuator on the machine could go from nothing to its
+       ceiling and back inside one substep -- which is what the measured chatter is.
+       SIGNED, deliberately. Limiting |tau| would let the torque flip +tauMax -> -tauMax freely,
+       since the magnitude never changes; a reversal is exactly the thing being suppressed. */
+    this.tauRate = o.tauRate ?? Infinity;
+    this.tauHeld = 0;                  // torque actually delivered last substep, N.m
+    this.governed = false;             // the rate cap bound this substep, not the torque ceiling
+    /* Per-FRAME substep extremes, filled by World.step. A log samples once per frame at best,
+       and every per-joint field used to be the value from ONE substep -- 1 in 232 of those
+       actually executed between samples. A snapshot of a bang-banging actuator is noise; the
+       envelope over the substeps is not, and it is honest at any sampling rate. */
+    this.tauPeak = 0; this.demandPeak = 0; this.ratePeak = 0; this.limitPeak = 0;
     this.enabled = true;
-    this.mode = o.mode || 'position';   // 'position' = servo to target, 'torque' = tauCmd
     this.tauFF = 0;                     // feedforward torque added to the servo, N.m
     this.lim = Object.assign({}, NO_LIMIT, o.lim);
     this.broken = false; this.util = 0; this.peakUtil = 0;
@@ -343,34 +338,36 @@ class Hinge {
     if (this.enabled && this.tauMax > 0) {
       const axis = a.dirWorld(this.axisA);
       const maxL = this.tauMax * h * h;
-      if (this.mode === 'torque') {
-        // direct torque command; reaction on the parent is automatic, so the mount
-        // still sees it and can be torn off by an overdriven actuator
-        let tot = Math.max(-maxL, Math.min(maxL, this.tauCmd * h * h));
-        const dl = tot - this.lm;
-        this.lm = tot;
-        const p = vmul(axis, dl);
-        if (b.invMass) rotateBy(b, applyInvI(b, p), +1);
-        if (a.invMass) rotateBy(a, applyInvI(a, p), -1);
-        this.saturated = Math.abs(this.tauCmd) > this.tauMax;
-      } else {
-        // Position mode is a real PD actuator with FINITE stiffness and damping, not a
-        // rigid constraint. A near-zero-compliance servo has effectively infinite gain,
-        // so millirad-level noise in a control signal becomes kN.m of oscillating torque.
-        let e = this.target - this.angle;
-        e = Math.atan2(Math.sin(e), Math.cos(e));
-        const wRel = vdot(vsub(b.w, a.w), axis);
-        // Feedforward rides ON TOP of the servo. A balance loop that replaces the PD
-        // term throws away the passive stiffness holding the posture up.
-        const tauPD = this.kp * e - this.kd * wRel + this.tauFF;
-        let tot = Math.max(-maxL, Math.min(maxL, tauPD * h * h));
-        const dl = tot - this.lm;
-        this.lm = tot;
-        const p = vmul(axis, dl);
-        if (b.invMass) rotateBy(b, applyInvI(b, p), +1);
-        if (a.invMass) rotateBy(a, applyInvI(a, p), -1);
-        this.saturated = Math.abs(tauPD) > this.tauMax;
+      // A real PD actuator with FINITE stiffness and damping, not a rigid constraint. A
+      // near-zero-compliance servo has effectively infinite gain, so millirad-level noise
+      // in a control signal becomes kN.m of oscillating torque.
+      // (There was a second `mode: 'torque'` branch here commanding tauCmd directly. No
+      // construction site ever passed `mode` and nothing ever wrote a Hinge's tauCmd, so it
+      // was unreachable, and its body was this one line for line after the command term.)
+      let e = this.target - this.angle;
+      e = Math.atan2(Math.sin(e), Math.cos(e));
+      const wRel = vdot(vsub(b.w, a.w), axis);
+      // Feedforward rides ON TOP of the servo. A balance loop that replaces the PD term
+      // throws away the passive stiffness holding the posture up.
+      const tauPD = this.kp * e - this.kd * wRel + this.tauFF;
+      this.wRel = wRel; this.tauDemand = tauPD;      // telemetry only; see the ctor
+      /* Governor, before the ceiling. tauHeld is what was actually delivered last substep and is
+         updated once per substep in measure(), so the cap is the same for all 8 iterations --
+         slewing per iteration would let it move 8x faster than the rate says. */
+      let tauCmd = tauPD;
+      if (this.tauRate !== Infinity) {
+        const dmax = this.tauRate * h;
+        const want = tauPD - this.tauHeld;
+        tauCmd = this.tauHeld + Math.max(-dmax, Math.min(dmax, want));
+        this.governed = Math.abs(want) > dmax;
       }
+      const tot = Math.max(-maxL, Math.min(maxL, tauCmd * h * h));
+      const dl = tot - this.lm;
+      this.lm = tot;
+      const p = vmul(axis, dl);
+      if (b.invMass) rotateBy(b, applyInvI(b, p), +1);
+      if (a.invMass) rotateBy(a, applyInvI(a, p), -1);
+      this.saturated = Math.abs(tauPD) > this.tauMax;
     }
     // 3. joint angle limits. A mechanical end stop is a real structure: it has finite
     // stiffness and whatever torque it carries is reacted by the same mount the actuator
@@ -398,6 +395,10 @@ class Hinge {
   measure(h) {
     const inv = 1 / (h * h);
     this.tau = this.lm * inv;
+    // Governor state, updated ONCE per substep (measure runs after the iteration loop). Reading
+    // the DELIVERED torque rather than the commanded one keeps the cap from winding up when the
+    // joint is also against tauMax or an end stop.
+    this.tauHeld = this.tau;
     this.F = vmul(this.lp, inv);
     this.T = vmul(this.la, inv);
     const n = this.a.dirWorld(this.axisA);
@@ -420,7 +421,6 @@ class GroundContacts {
   constructor(o = {}) {
     this.lscale = o.lscale ?? 1;
     this.mu = o.mu ?? 0.9;
-    this.restitution = o.restitution ?? 0;
     this.compliance = o.compliance ?? 0;
     this.active = [];
   }
@@ -510,7 +510,7 @@ class PairCollision {
     this.a = o.a; this.b = o.b;
     this.compliance = o.compliance ?? 0;
     this.margin = o.margin ?? 0;         // keep this much clear air between them
-    this.depth = 0; this.maxDepth = 0;
+    this.depth = 0;
   }
   reset() { this.lam = 0; }
   axes() {
@@ -537,7 +537,6 @@ class PairCollision {
       if (ov < best) { best = ov; axis = vdot(d, n) < 0 ? vmul(n, -1) : n; }
     }
     this.depth = best;
-    if (best > this.maxDepth) this.maxDepth = best;
     const w1 = a.invMass, w2 = b.invMass, ws = w1 + w2;
     if (ws < 1e-18) return;
     const al = this.compliance / (h * h);
@@ -572,7 +571,24 @@ class World {
 
   step(dt) {
     const n = this.substeps, h = dt / n;
-    for (const b of this.bodies) { b._cImp = 0; b._cCop = V(); }
+    /* SENSOR ACCUMULATORS. contactForce below is a frame MEAN, and a frame mean cannot see
+       a servo limit-cycling inside the substep: standing still, the instantaneous load on a
+       foot swings 0.00-3.28 W while the mean reads 1.00. Every "the foot is loaded" gate in
+       this project has been blind to that. _cMin/_cMax carry the substep extremes out with
+       the mean, _cTan gives the friction-cone utilisation that predicts a slide before it
+       happens, and _cSlip measures the slide itself. Instrumentation only -- nothing here
+       feeds a control law yet. */
+    for (const b of this.bodies) {
+      b._cImp = 0; b._cCop = V(); b._cTan = 0; b._cSlip = 0;
+      b._cMin = Infinity; b._cMax = 0; b._cN = 0;
+    }
+    /* JOINT ACCUMULATORS, the same argument as the contact ones above. Every per-joint number
+       a log could carry was the last substep's, so 231 of every 232 executed substeps were
+       observed by nothing and a railed actuator was indistinguishable from a quiet one that
+       happened to be sampled mid-swing. Carry the substep extremes out with the frame. */
+    for (const j of this.joints) {
+      j._satN = 0; j._govN = 0; j._tauPk = 0; j._demPk = 0; j._wRelPk = 0; j._limPk = 0;
+    }
     for (let s = 0; s < n; s++) {
       if (this.enableGround) this.contacts.collect(this.bodies, h);
       for (const b of this.bodies) integrate(b, h, this.g);
@@ -585,19 +601,42 @@ class World {
         for (const p of this.pairs) p.solve(h);
         if (this.enableGround) this.contacts.solve(h);
       }
+      for (const b of this.bodies) b._cSub = 0;
       for (const c of this.contacts.active) {
         if (c.lambda > 0) {
           c.b._cImp += c.lambda;
+          c.b._cSub += c.lambda;
           c.b._cCop = vadd(c.b._cCop, vmul(c.b.toWorld(c.lp), c.lambda));
+          c.b._cTan += c.lambdaT;
         }
       }
+      for (const b of this.bodies) {
+        if (b._cSub <= 0) continue;
+        if (b._cSub < b._cMin) b._cMin = b._cSub;
+        if (b._cSub > b._cMax) b._cMax = b._cSub;
+        b._cN++;
+      }
       for (const b of this.bodies) updateVel(b, h);
+      /* Slip is read AFTER updateVel, from the contact point's post-solve velocity: it is
+         what the foot is actually doing on the ground, not what the solver asked for.
+         Impulse-weighted so a barely-loaded contact cannot dominate the average. */
+      for (const c of this.contacts.active) {
+        if (c.lambda <= 0) continue;
+        const rc = qrot(c.b.q, c.lp);
+        const vp = vadd(c.b.v, vcross(c.b.w, rc));
+        c.b._cSlip += Math.sqrt(vp.x * vp.x + vp.z * vp.z) * c.lambda;
+      }
       for (const j of this.joints) {
         if (j.broken) continue;
         j.measure(h);
+        if (j.saturated) j._satN++;
+        if (j.governed) j._govN++;
+        const aTau = Math.abs(j.tau);            if (aTau > j._tauPk) j._tauPk = aTau;
+        const aDem = Math.abs(j.tauDemand);      if (aDem > j._demPk) j._demPk = aDem;
+        const aRate = Math.abs(j.wRel);          if (aRate > j._wRelPk) j._wRelPk = aRate;
+        const aLim = Math.abs(j.tauLimit);       if (aLim > j._limPk) j._limPk = aLim;
         if (j.broken) {
           this.breakEvents.push({ t: this.time + (s + 1) * h, joint: j.name, util: j.brokeAtUtil, F: j.F, T: j.T });
-          j.b.detached = true;
         }
       }
       for (const w of this.welds) {
@@ -605,7 +644,6 @@ class World {
         if (w.broken && !w.reported) {
           w.reported = true;
           this.breakEvents.push({ t: this.time + (s + 1) * h, weld: w.name, util: w.brokeAtUtil, F: w.F, T: w.T });
-          w.b.detached = true;
         }
       }
       this.time += h;
@@ -615,20 +653,23 @@ class World {
     for (const b of this.bodies) {
       b.contactForce = b._cImp / (n * h * h);
       b.contactCop = b._cImp > 0 ? vmul(b._cCop, 1 / b._cImp) : null;
+      /* ...and the substep extremes alongside it, because the mean is what hid the
+         limit cycle. contactForceMin is over substeps that HAD contact, so a swing foot
+         reads 0 rather than dragging the minimum of a stance foot to zero. */
+      b.contactForceMin = b._cN ? b._cMin / (h * h) : 0;
+      b.contactForceMax = b._cN ? b._cMax / (h * h) : 0;
+      // 0 = no tangential demand, 1 = riding the friction cone and about to slide.
+      b.contactCone = b._cImp > 0 ? b._cTan / (this.contacts.mu * b._cImp) : 0;
+      b.contactSlip = b._cImp > 0 ? b._cSlip / b._cImp : 0;   // m/s
     }
-  }
-  energy() {
-    let e = 0;
-    for (const b of this.bodies) {
-      if (b.invMass === 0) continue;
-      e += b.kinetic() + b.mass * (-this.g.y) * b.x.y;
+    // Fraction of substeps this joint spent against its torque ceiling. A joint that is
+    // merely working hard reads low; one that is bang-banging reads near 1.
+    for (const j of this.joints) {
+      j.satFrac = j._satN / n;
+      j.govFrac = j._govN / n;
+      j.tauPeak = j._tauPk; j.demandPeak = j._demPk;
+      j.ratePeak = j._wRelPk; j.limitPeak = j._limPk;
     }
-    return e;
-  }
-  com() {
-    let M = 0, c = V();
-    for (const b of this.bodies) { if (b.invMass === 0) continue; M += b.mass; c = vadd(c, vmul(b.x, b.mass)); }
-    return { mass: M, pos: vmul(c, 1 / M) };
   }
 }
 
@@ -640,8 +681,22 @@ function integrate(b, h, g) {
   // implicit gyroscopic term (one Newton step), then external torque
   let wl = qrotInv(b.q, b.w);
   const Iw = m3mulv(b.I, wl);
-  const resid = vmul(vcross(wl, Iw), h);
-  const J = m3add(b.I, m3scale(m3sub(m3mul(skew(wl), b.I), skew(Iw)), h));
+  /* SPINNING ROTOR. A flywheel bolted into this body carries angular momentum that is not
+     I*omega, so Euler's equation is dL/dt + omega x L = tau with L = I*omega + h_rotor,
+     not L = I*omega. Adding h_rotor to the momentum HERE rather than as an external torque
+     is the whole point: this branch is solved implicitly in omega, and the same term
+     applied explicitly through tExt is unconditionally unstable.
+     It was shipped that way once. tau = -omega x h does zero work, which was verified
+     exactly, and it still detonated: explicit Euler on a precession term does not precess,
+     it spirals, growing by sqrt(1 + (h*dt/I)^2) every substep. Measured at MK1.7.0 the
+     Light Frame ran h*dt/I = 0.89, which is 3.8e305 per second, and the passive torque hit
+     173 840% of the actuator ceiling in 0.7 s while the active loop sat at 4-9%.
+     Same defect as the servo damping term, which is also explicit. Checking that a term
+     conserves energy says nothing about whether its DISCRETISATION does.
+     Spin axis is the body's own +Y. */
+  const Lw = b.hRotor ? vadd(Iw, V(0, b.hRotor, 0)) : Iw;
+  const resid = vmul(vcross(wl, Lw), h);
+  const J = m3add(b.I, m3scale(m3sub(m3mul(skew(wl), b.I), skew(Lw)), h));
   wl = vsub(wl, m3mulv(m3inv(J), resid));
   const tl = qrotInv(b.q, b.tExt);
   wl = vadd(wl, vmul(m3mulv(b.invI, tl), h));
@@ -651,14 +706,11 @@ function integrate(b, h, g) {
 }
 function updateVel(b, h) {
   if (b.invMass === 0) return;
-  const vPrev = b.v, wPrev = b.w;
   b.v = vmul(vsub(b.x, b.xp), 1 / h);
   let dq = qmul(b.q, qconj(b.qp));
   if (dq.w < 0) dq = { x: -dq.x, y: -dq.y, z: -dq.z, w: -dq.w };
   const sv = Math.hypot(dq.x, dq.y, dq.z);          // exact log map
-  if (sv < 1e-12) { b.w = V(); b.a = vmul(vsub(b.v, vPrev), 1 / h); b.alpha = vmul(vsub(b.w, wPrev), 1 / h); return; }
+  if (sv < 1e-12) { b.w = V(); return; }
   const ang = 2 * Math.atan2(sv, dq.w);
   b.w = vmul(V(dq.x, dq.y, dq.z), ang / (sv * h));
-  b.a = vmul(vsub(b.v, vPrev), 1 / h);
-  b.alpha = vmul(vsub(b.w, wPrev), 1 / h);
 }

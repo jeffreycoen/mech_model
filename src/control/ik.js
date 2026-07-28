@@ -19,8 +19,10 @@ const wrapPi = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 
 /* Solve for the five joint angles that put the ankle pivot at `d`, expressed in the
    pelvis frame relative to the hip pivot, with the sole held flat.
-   Returns { hipRoll, hipPitch, knee, anklePitch, ankleRoll, reach } where `reach` is the
-   fraction of full leg extension demanded (>=1 means the target is unreachable). */
+   Returns { hipRoll, hipPitch, knee, anklePitch, ankleRoll, reach, ext } where `reach` is the
+   fraction of full leg extension DEMANDED (>=1 means the target is unreachable) and `ext` is
+   the fraction actually COMMANDED after clamping. Feed `ext` back as `opts.holdExt` next
+   frame -- see the unreachable-target clamp below for why. */
 function legIK(d0, opts = {}) {
   const Lt = opts.thigh ?? LEG.thigh, Ls = opts.shin ?? LEG.shin;
   const maxR = (Lt + Ls) * (opts.maxExtend ?? 0.995);
@@ -44,7 +46,32 @@ function legIK(d0, opts = {}) {
   const b = Math.hypot(d.y, d.z);
   let r = Math.hypot(a, b);
   const reach = r / (Lt + Ls);
-  if (r > maxR) r = maxR;
+  /* UNREACHABLE TARGET: CLAMP, BUT NEVER LENGTHEN THE LEG TO MEET IT.
+     This line used to be a bare `if (r > maxR) r = maxR`, which is the machine's launch
+     mechanism. maxExtend is 0.995 and the stance leg rests at restExt 0.93, so an out-of-range
+     target did not merely fail to be met -- it commanded the leg 11.7 mm LONGER than the one
+     it was holding (Light Frame, leg 180.1 mm), on both legs at once, into a stance spring of
+     11.5 kN/m per leg where 3.46 mm of length error already rails a knee. The servos drove to
+     it and the machine threw itself off the floor: driving log s20260727004023 at t=10.6,
+     pelvis 0.830 -> 0.962 m, vertical velocity -0.01 -> +1.50 m/s in one 10 Hz sample, both
+     feet unloading for 0.3 s, torso mount torn at util 1.04. chassis.js bodyRef() rate-limits
+     the REFERENCE, which changes how fast the target leaves the reachable set; it cannot stop
+     the clamp lengthening the leg once it has.
+
+     So when the demand is unreachable, hold the length already commanded (`opts.holdExt`, fed
+     back from the previous frame's `ext`) instead of straightening. REACHABLE targets are
+     untouched -- the clamp only engages above maxR -- so ordinary walking, where the stride cap
+     is sized to keep reach inside 0.995 at both ends of stance, sees no change at all.
+
+     THE COST, stated because it is real: a leg that genuinely needs to extend past its held
+     length while the target is out of range will now refuse to, and a swing foot can end up
+     short of its placement rather than snapping straight. That is deliberate -- an
+     under-extended leg in the air costs a footfall, an over-extended one on the ground costs
+     the whole machine. With no holdExt supplied (gate G11, any standalone caller) the old
+     behaviour is unchanged. */
+  if (r > maxR) {
+    r = opts.holdExt !== undefined ? Math.min(maxR, (Lt + Ls) * opts.holdExt) : maxR;
+  }
   const rEps = 3.4e-5 * (Lt + Ls);   // SCALE FIX: was an absolute 1e-4 m
   if (r < Math.abs(Lt - Ls) + rEps) r = Math.abs(Lt - Ls) + rEps;
 
@@ -63,7 +90,7 @@ function legIK(d0, opts = {}) {
   const anklePitch = -(hipPitch + knee);
   const ankleRoll = -hipRoll;
 
-  return { hipYaw, hipRoll, hipPitch, knee, anklePitch, ankleRoll, reach };
+  return { hipYaw, hipRoll, hipPitch, knee, anklePitch, ankleRoll, reach, ext: r / (Lt + Ls) };
 }
 
 /* Forward kinematics of the same chain, used to verify the inverse. */

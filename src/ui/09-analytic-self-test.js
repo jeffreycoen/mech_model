@@ -12,8 +12,21 @@ function freshRig(o){
   setGravity(gv);
   const w=new World({substeps:10,iterations:8,contact:{mu:1.0},gravity:V(0,-gv,0)});
   const r=assembleMech(w,{}); groundRig(r);
+  const dg=deriveGait(r);
+  /* Everything the RIG determines is derived from the rig, exactly as buildWorld() derives
+     it. This used to hardcode turnRate as MAX_TURN -- 8 deg/s, a constant the artifact
+     itself had already stopped using -- carry no yawPerStep at all, and let the balance
+     controller fall back to absolute 0.36/0.24 m CoP limits belonging to no particular
+     machine. A self test that quietly asserts against a different configuration than the
+     one it ships beside is the in-artifact version of the harness drift this project has
+     already been bitten by three times.
+     copClamp, tSS and kCop stay explicit on purpose: they are the fixtures the analytic
+     assertions are written against on the unscaled reference rig, and 0.40 is what the
+     live build hands any preset that declares no kCop of its own. */
   const g=new GaitController(r,{copClamp:0.45,tSS:0.90,gravity:gv,
-    travelRate:TRAVEL_RATE,turnRate:MAX_TURN,balance:{kCop:0.40}});
+    travelRate:dg.travelRate,turnRate:dg.turnRate,yawPerStep:dg.yawPerStep,
+    waistLimit:dg.waistLimit,waistRate:dg.waistRate,pelvisRate:dg.pelvisRate,
+    balance:{kCop:0.40,copLimitX:dg.copLimitX,copLimitZ:dg.copLimitZ}});
   return {w,r,g};
 }
 function walk(ctx,stride,frames,cb){
@@ -244,12 +257,24 @@ document.getElementById('gateBtn').addEventListener('click',runGates);
 /* The envelope control. Default is the measured no-fall cap; this lets you drive past it
    on purpose, says so on screen, and records the crossing in the session log. */
 const sizeBtn=document.getElementById('sizeBtn');
+/* One size ships, so the control hides itself rather than presenting a button that cycles
+   a list of length one. Driven off SIZES.length, not deleted, so putting a size back in
+   the array brings the button back with it. */
+if(SIZES.length<2) sizeBtn.style.display='none';
+sizeBtn.textContent='Size: '+SIZES[sizeIdx].label;
 sizeBtn.addEventListener('click',function(){
   sizeIdx=(sizeIdx+1)%SIZES.length;
   sizeBtn.textContent='Size: '+SIZES[sizeIdx].label;
   logEvent('size',{target:SIZES[sizeIdx].h});
   buildWorld(preset);
 });
+/* RESPAWN. Rebuilding the world is exactly what the preset and size buttons already do,
+   so respawn is that with the same argument -- no separate reset path to fall out of sync.
+   The FELL chip is wired to it as well: when the machine is down, the thing you want is one
+   tap away rather than three taps into a panel. */
+function respawn(){ logEvent('respawn',{}); buildWorld(preset); }
+document.getElementById('respawnBtn').addEventListener('click',respawn);
+document.getElementById('c-fall').addEventListener('click',respawn);
 const cmgBtn=document.getElementById('cmgBtn');
 cmgBtn.addEventListener('click',function(){
   cmgOn=!cmgOn;

@@ -5,13 +5,18 @@
     "src/control/ik.js",
     "src/rig/mech.js",
     "src/rig/atst.js",
+    "src/rig/atat.js",
+    "src/rig/assemble.js",
     "src/control/posture.js",
     "src/control/balance.js",
     "src/control/cmg.js",
     "src/control/dcm.js",
+    "src/control/chassis.js",
     "src/control/gait.js",
+    "src/control/crawl.js",
     "src/rig/presets.js",
-    "src/rig/derive.js"
+    "src/rig/derive.js",
+    "src/rig/build.js"
   ],
   "ui": [
     "src/ui/02-scene.js",

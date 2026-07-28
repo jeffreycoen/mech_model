@@ -15,12 +15,12 @@
 
 const smooth = (t) => (t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t));
 
-class GaitController {
+/* The biped. Command model, waist ring and yaw steering are inherited from Chassis --
+   what is here is the part that is genuinely bipedal: a DCM plan, two footprints, and a
+   swing/stance alternation. */
+class GaitController extends Chassis {
   constructor(rig, cfg = {}) {
-    this.rig = rig;
-    this.posture = new Posture(rig);
-    this.balance = new BalanceController(rig, Object.assign({ hipKp: 0, hipKd: 0 }, cfg.balance || {}));
-    this.k = Object.assign({
+    super(rig, cfg, {
       pelvisDrop: 0.25,
       settleTime: 0.4,
       crouchTime: 1.4,
@@ -31,115 +31,37 @@ class GaitController {
       stepHeight: 0.14,
       kDCM: 2.0,           // DCM error feedback, >1 for stable error dynamics
       copClamp: 0.45,      // how far the CoP may deviate from the planned ZMP, m
-      gravity: 9.81,       // must match the world; the LIPM frequency depends on it
       trackMeasured: false, // reference-frame IK is correct: leg deflection IS the force
       replan: true,        // rebuild the plan from MEASURED feet at each touchdown
       lateralCorrect: 0.22, // lateral error corrected in the commanded swing target
       centrePull: 0.18,     // how hard the footprint pair is pulled back onto its line
       plantPin: 0.22,      // lateral error corrected in the recorded print at touchdown
-      turnEps: 4 * Math.PI / 180,   // heading error that justifies a step, rad
-      turnEpsHold: 14 * Math.PI / 180,  // wider band to LEAVE stand, so it settles
-      yawPerStep: 20 * Math.PI / 180,  // most the body can turn in one step, rad
-      minFootSep: 1.16,    // commanded lateral clearance between prints, m (foot width + air)
-      travelRate: 0.06,    // m of per-step travel change per second of command
-      turnRate: 4 * Math.PI / 180,  // rad/s of facing change
+      minFootSep: 1.16,    // commanded lateral clearance between prints, m
+      /* Hard ceiling on foot separation, as a multiple of nominal stance. The recorded
+         failure is at 1.6x -- "a strafe splays the pair to 1.6x nominal stance and tears
+         the outboard leg" -- so this sits below it rather than at it. It only binds when
+         the commanded lateral stride would open the pair further than this in one step;
+         below that the step-out/step-together bound in the swing target governs. */
+      /* 1.45 -> 1.30. At 1.45 the Scout tore footL at util 1.141 with the machine UPRIGHT
+         (up 0.993, both feet loaded at 1.61 W) -- a structural failure, not post-fall
+         impact, and the Heavy tore footRR the same way at 4.68 W. This was ranked the
+         highest-risk item on the list when it shipped and it is the one that failed.
+         1.30 keeps roughly two thirds of the strafe the widening bought while pulling the
+         ceiling well clear of the 1.6x the code records as tearing the outboard leg. */
+      splayMax: 1.30,
+      /* Fore-aft offset, as a fraction of nominal stance, above which a release takes a
+         squaring step instead of resting. 0.15 of a 1.20 m stance is 0.18 m native; the
+         two bad releases measured 141 and 147 mm at a 73 mm stance, which is 2x. */
+      squareTol: 0.15,
+      /* Pelvis rise/crouch rate, in units of pelvisDrop per second. 1.5 puts a full
+         stand-up at 0.67 s -- slower than a step, so it cannot outrun the gait, and fast
+         enough to read as standing up rather than drifting. */
+      riseRate: 1.5,
       tSS: 0.90, tDS: 0.50,
       closeOnStop: true,   // take a squaring-up step when the stick is released
-      enabled: true,
-    }, cfg);
-    this.t = 0;
-    this.state = 'INIT';
-    this.debug = {};
-    /* Command model. `travel` is a per-step displacement VECTOR in world metres and
-       `facing` is the yaw the body points at -- the two are independent, which is what
-       twin-stick means and what the old {stride, heading} pair could not express. With
-       only a scalar stride along a single heading there is no way to ask for a strafe.
-
-       Every command starts at ZERO. The old constructor seeded cmd and active from
-       k.stride (0.30 in the shipped artifact), and callers that wanted a standstill only
-       ever zeroed `want`. `cmd` then slewed down from 0.30 while warm-up ran, and the plan
-       latched `active` at roughly 0.19 m before the slew reached zero -- so the rig walked
-       off on its own with nobody touching the controls. */
-    this.stopping = false;
-    this.cmd    = { tx: 0, tz: 0, facing: 0 };
-    this.active = { tx: 0, tz: 0, facing: 0 };
-    // What the UI asks for. `cmd` slews toward it at a rate the gait can absorb; a step
-    // change is a disturbance the walk may not survive, so the limiter is a correctness
-    // device. Its rate is measured against an adversarial input script, not guessed.
-    this.want   = { tx: 0, tz: 0, facing: 0 };
+    });
   }
 
-  /* magnitude of the commanded per-step travel, m */
-  speedCmd() { return Math.hypot(this.want.tx, this.want.tz); }
-  /* Yaw error between where the FEET are pointed and where the stick wants to face.
-     Turning is a stepping manoeuvre -- the feet are planted, so the only way to rotate
-     the machine is to pick one up and set it down rotated. */
-  bodyYaw() { const f = qrot(this.rig.bodies.torso.q, V(1, 0, 0)); return Math.atan2(-f.z, f.x); }
-  yawCmd() { return Math.abs(wrapPi(this.want.facing - this.bodyYaw())); }
-  /* ONE predicate for "the driver wants something". It was written out separately at the
-     two sites that need it -- entering the walk and deciding to end it -- and only the
-     first got the turn term, so a pure turn started and then closed itself out after a
-     few steps with the heading still unreached. */
-  wantsMove() {
-    /* Hysteresis. The machine delivers only ~4 deg of yaw per step and body yaw is
-       unregulated, so a bare 4 deg threshold is re-tripped by the residual the moment it
-       stands: close step -> STAND -> still off by more than turnEps -> walk again, for
-       ever. It never settles, and every extra shuffle re-rolls the dice on a fall.
-       Standing takes a wider band than starting does. */
-    const eps = this.standing ? this.k.turnEpsHold : this.k.turnEps;
-    return this.speedCmd() > this.moveEps() || this.yawCmd() > eps;
-  }
-  /* SCALE FIX: the "is the stick pushed" threshold was an absolute 30 mm. A 1 ft rig has
-     a total stride range of 58 mm, so more than half of the stick read as stopped. */
-  moveEps() { return 0.01 * (this.rig.leg.thigh + this.rig.leg.shin); }
-
-  slew(dt) {
-    // travel slews as a VECTOR, so a direction change costs the same as a speed change
-    let ex = this.want.tx - this.cmd.tx, ez = this.want.tz - this.cmd.tz;
-    const e = Math.hypot(ex, ez), dr = this.k.travelRate * dt;
-    if (e > dr && e > 0) { ex *= dr / e; ez *= dr / e; }
-    this.cmd.tx += ex; this.cmd.tz += ez;
-    const dh = this.k.turnRate * dt;
-    const eh = wrapPi(this.want.facing - this.cmd.facing);
-    this.cmd.facing += Math.max(-dh, Math.min(dh, eh));
-    /* The feet only rotate when one is picked up and set down turned, so the commanded
-       frame must never lead the PLANTED feet by more than a single step's worth of yaw.
-       Without this the command races to the target, the controller reads itself as
-       aligned and stops after two steps while the machine still points the old way --
-       measured at 3x, 5x and 8x turn rate. This one constraint also replaces turn-rate
-       tuning: the per-step cap is the real limiter. */
-    /* Cap against MEASURED body yaw, not against another command. The machine delivers
-       only about a quarter of the yaw it is told to per step, so capping command-against-
-       command let the commanded frame run four steps ahead of where the mech physically
-       pointed -- and every placement rule works in that frame. Capping against reality
-       makes the command wait for the body. */
-    const by = this.bodyYaw(), cap = this.k.yawPerStep;
-    const lead = wrapPi(this.cmd.facing - by);
-    if (lead > cap) this.cmd.facing = by + cap;
-    else if (lead < -cap) this.cmd.facing = by - cap;
-  }
-
-  latch() { this.active = { tx: this.cmd.tx, tz: this.cmd.tz, facing: this.cmd.facing }; }
-
-  /* forward and left unit vectors for the current FACING (yaw about +Y). Stance width and
-     the lateral placement correction are body-relative, so they key off facing, never off
-     the direction of travel. */
-  /* comToPelvis is captured at spawn, facing 0. Anywhere it is added back it must be
-     rotated to the CURRENT facing, or the pelvis is commanded off-axis relative to the
-     legs after every turn -- a standing bias the balance loop then fights forever. */
-  comOff() {
-    const h = this.active.facing, ch = Math.cos(h), sh = Math.sin(h);
-    const c = this.comToPelvis;
-    return V(c.x * ch + c.z * sh, 0, -c.x * sh + c.z * ch);
-  }
-  basis() {
-    const h = this.active.facing;
-    return { fwd: V(Math.cos(h), 0, -Math.sin(h)), left: V(Math.sin(h), 0, Math.cos(h)) };
-  }
-  strideVec() { return V(this.active.tx, 0, this.active.tz); }
-  yawQuat() { return qAxisAngle(V(0, 1, 0), this.active.facing); }
-  /* both feet point where the body faces; the yaw ring is what makes this expressible */
-  footYaw() { return { L: this.active.facing, R: this.active.facing }; }
 
   init(st) {
     const r = this.rig;
@@ -165,6 +87,13 @@ class GaitController {
                     (this.plant.L.z + this.plant.R.z) / 2);
     this.halfStance = (this.plant.L.z - this.plant.R.z) / 2;
     this.planned = false;
+    /* Start AT REST. `standing` was left undefined here, which is falsy, so the first
+       update after warm-up fell straight into the walking branch and the machine took two
+       zero-length steps on spawn with nobody touching the controls -- then discovered
+       there was no command and closed itself out. Standing is the resting state; it is
+       left the instant a command arrives. */
+    this.standing = true;
+    this.stopping = false;
   }
 
   buildPlan(st) {
@@ -245,6 +174,10 @@ class GaitController {
 
   update(st, dt) {
     if (!this.plant) this.init(st);
+    /* Before anything else, and unconditionally -- the turret answers the stick during
+       warm-up, while standing, mid-swing and after a fall. It is the one control on the
+       machine that never has to wait for the gait. */
+    this.waistErr = this.updateWaist(dt);
     this.slew(dt);
     /* MEASURED yaw, not the commanded frame. `active.facing` is latched at step
        boundaries and is allowed to lead measured yaw by a full yawPerStep (20 deg); the
@@ -259,10 +192,17 @@ class GaitController {
     const warm = this.k.settleTime + this.k.crouchTime;
     if (this.t < warm) {
       const u = smooth(clamp((this.t - this.k.settleTime) / this.k.crouchTime, 0, 1));
-      const y = this.pelvisStart.y + (this.pelvisY - this.pelvisStart.y) * u;
+      /* Against the explicit crouch, not against this.pelvisY -- pelvisY is now a live
+         value that rises while standing, and reading it here would make the warm-up ease
+         toward whatever height the machine last happened to be at. */
+      const crouchY = this.pelvisStart.y - this.k.pelvisDrop;
+      const y = this.pelvisStart.y + (crouchY - this.pelvisStart.y) * u;
+      this.pelvisY = y;
       this.balance.copOverride = null;
       this.balance.update(st, dt);
-      this.posture.apply(V(this.pelvisStart.x, y, this.pelvisStart.z), this.plant, null, this.yawQuat(), this.footYaw());
+      // Warm-up: both feet planted, so no phase-correct steering. Rings stay flat.
+      this.posture.apply(this.bodyRef(V(this.pelvisStart.x, y, this.pelvisStart.z), dt),
+                         this.plant, null, this.yawQuat(), this.footYaw(null), null, dt);
       this.state = 'WARMUP';
       this.debug = { state: this.state, u };
       return;
@@ -279,18 +219,48 @@ class GaitController {
        heading never reached, at 1x, 3x, 5x and 8x turn rate. Turning in place had been
        recorded as "clean" purely because standing still cannot fall over. */
     const wantMove = this.wantsMove();
-    if (wantMove && this.stopping) this.stopping = false;   // stick came back mid-close
+    /* Only a real TRAVEL command aborts a stop in progress. Aborting on any wantsMove()
+       meant the yaw residual left over from the turn cancelled every close, so letting go
+       of the stick after turning marched in place for ever instead of coming to rest. A
+       driver who wants to keep going pushes the stick; a residual does not. A driver still
+       asking for facing gets it one step later, out of STAND, which is survivable -- an
+       abandoned close is not, because it parks the rig mid-lunge on one loaded ankle. */
+    if (this.stopping && this.speedCmd() > this.moveEps()) this.stopping = false;
     if (this.standing) {
       if (wantMove) { this.standing = false; this._fromStand = true; this.rebuild(st); this._fromStand = false; }
       else {
-        this.balance.copOverride = null;
-        this.balance.update(st, dt);
-        const mid = V((this.plant.L.x + this.plant.R.x) / 2, 0, (this.plant.L.z + this.plant.R.z) / 2);
-        this.posture.apply(V(mid.x + this.comOff().x, this.pelvisY, mid.z + this.comOff().z),
-                           this.plant, null, this.yawQuat(), this.footYaw());
-        this.state = 'STAND';
-        this.debug = { state: 'STAND', steps: this.stepsTaken };
-        return;
+        /* NEUTRAL STANCE, part 1: do not rest in a lunge.
+           The closing step only ever fired at a touchdown, so releasing the stick outside
+           that window left the pair wherever the walk had them. Measured over four releases
+           in s20260727124635: two squared up to a 7 mm fore-aft offset and two rested at
+           141 and 147 mm -- on a 300 mm machine that is half its own height, parked on one
+           loaded ankle, which is the load case the closing step exists to avoid.
+           Squaring by sliding the planted feet would be commanded scrub, so instead take
+           the closing STEP that already exists and is already tested. squareTries caps it
+           so a close that cannot converge cannot march for ever. */
+        const b0 = this.basis();
+        const fa = (this.plant.L.x - this.plant.R.x) * b0.fwd.x
+                 + (this.plant.L.z - this.plant.R.z) * b0.fwd.z;
+        if (Math.abs(fa) > this.k.squareTol * 2 * this.halfStance
+            && (this.squareTries || 0) < 2) {
+          this.squareTries = (this.squareTries || 0) + 1;
+          this.standing = false; this.stopping = true;
+          this.closeStep(st);
+        } else {
+          this.squareTries = 0;
+          this.balance.copOverride = null;
+          this.balance.update(st, dt);
+          const mid = V((this.plant.L.x + this.plant.R.x) / 2, 0, (this.plant.L.z + this.plant.R.z) / 2);
+          // Resting. Both feet planted, rings flat and compliant -- steering here would have
+          // the two legs scrubbing against each other through the ground while the machine
+          // is meant to be standing still.
+          this.posture.apply(this.bodyRef(V(mid.x + this.comOff().x, this.standHeight(dt),
+                                            mid.z + this.comOff().z), dt),
+                             this.plant, null, this.yawQuat(), this.footYaw(null), null, dt);
+          this.state = 'STAND';
+          this.debug = { state: 'STAND', steps: this.stepsTaken, rise: +(this.pelvisY).toFixed(4) };
+          return;
+        }
       }
     }
 
@@ -399,12 +369,25 @@ class GaitController {
         tx += b.left.x * (need - sepLat);
         tz += b.left.z * (need - sepLat);
       }
-      /* Splay bound -- mirror of the pinch clamp above. Without it a strafe splays the
-         pair to 1.6x nominal stance and tears the outboard leg; the direction that
-         happens to pinch instead gets clamped into a survivable step-together gait.
-         Bound the splay symmetrically so both directions get the survivable gait. */
-      const maxSep = Math.max(4 * this.halfStance - this.k.minFootSep,
-                              this.k.minFootSep * 1.05);
+      /* Splay bound -- mirror of the pinch clamp above. Without any bound a strafe splays
+         the pair to 1.6x nominal stance and tears the outboard leg.
+         The old bound was a CONSTANT, max(4*halfStance - minFootSep, minFootSep*1.05),
+         which on the Scout is 1.24 m against a 1.20 m nominal separation and a 1.40 m
+         stride cap: the swing foot got 0.04 m of lateral travel out of a possible 1.40, so
+         97% of the coronal channel was clamped away and a sideways command produced
+         essentially nothing. That was survivable only because auto-face turned every
+         sideways command into a forwards one before the gait ever saw it. With rotation
+         moved to the right stick, this bound IS the strafe.
+         So bound it by what was actually asked for instead of by a constant: one step may
+         open the pair by the commanded LATERAL stride and the pinch clamp above closes it
+         on the next -- step out, step together, which is how a person side-steps. The hard
+         ceiling stays below the 1.6x that tore the leg, with margin. */
+      const latStride = Math.abs(sv.x * b.left.x + sv.z * b.left.z);
+      const maxSep = Math.min(
+        Math.max(2 * this.halfStance + latStride,
+                 4 * this.halfStance - this.k.minFootSep,
+                 this.k.minFootSep * 1.05),
+        this.k.splayMax * 2 * this.halfStance);
       if (sign * sepLat > maxSep) {
         tx += b.left.x * (sign * maxSep - sepLat);
         tz += b.left.z * (sign * maxSep - sepLat);
@@ -424,9 +407,15 @@ class GaitController {
     this.balance.update(st, dt);
 
     // --- pelvis follows the planned COM ---------------------------------------------
-    const pelvisRef = V(ref.com.x + this.comOff().x, this.pelvisY, ref.com.z + this.comOff().z);
+    // walkHeight() slews back down to the crouch: leaving STAND at full height and stepping
+    // from there would hand the swing leg the whole drop in one frame.
+    const pelvisRef = V(ref.com.x + this.comOff().x, this.walkHeight(dt), ref.com.z + this.comOff().z);
     const pelvisNow = this.rig.bodies.pelvis.x;
-    this.posture.apply(pelvisRef, feet, this.k.trackMeasured ? pelvisNow : null, this.yawQuat(), this.footYaw());
+    /* `swing` is null in double support, which passes null through and leaves the rings
+       flat. Steering only happens in single support, where one foot is pinned and the
+       other is free -- the only phase where the two legs can be given opposite jobs. */
+    this.posture.apply(this.bodyRef(pelvisRef, dt), feet, this.k.trackMeasured ? pelvisNow : null,
+                       this.yawQuat(), this.footYaw(swing), swing ? this.bodyYaw() : null, dt);
 
     this.state = kind;
     this.debug = {
