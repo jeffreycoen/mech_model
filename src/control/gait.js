@@ -233,9 +233,6 @@ class GaitController extends Chassis {
        heading never reached, at 1x, 3x, 5x and 8x turn rate. Turning in place had been
        recorded as "clean" purely because standing still cannot fall over. */
     const wantMove = this.wantsMove();
-    // Catch-step cooldown clock (MK1.40.0) -- armed at the touchdown of every completed
-    // stop/catch step, see below.
-    if (this.catchCool) this.catchCool = Math.max(0, this.catchCool - dt);
     /* Only a real TRAVEL command aborts a stop in progress. Aborting on any wantsMove()
        meant the yaw residual left over from the turn cancelled every close, so letting go
        of the stick after turning marched in place for ever instead of coming to rest. A
@@ -281,9 +278,8 @@ class GaitController extends Chassis {
                 midZ = (this.plant.L.z + this.plant.R.z) / 2;
           const exF = (xi.x - midX) * b0.fwd.x + (xi.z - midZ) * b0.fwd.z;
           const exL = (xi.x - midX) * b0.left.x + (xi.z - midZ) * b0.left.z;
-          if ((Math.abs(exF) > this.balance.k.copLimitX
-               || Math.abs(exL) > this.balance.k.copLimitZ + this.halfStance)
-              && !this.catchCool) {
+          if (Math.abs(exF) > this.balance.k.copLimitX
+              || Math.abs(exL) > this.balance.k.copLimitZ + this.halfStance) {
             // No return: fall through to the walk section like the squaring path, so the
             // fresh plan gets its posture command THIS tick.
             this.standing = false; this.stopping = true;
@@ -378,16 +374,15 @@ class GaitController extends Chassis {
          milliseconds after the stick was released, while the rig was still upright.
          Instead, take one CLOSING step that brings the trailing foot alongside the stance
          foot, then stand. */
-      if (this.stopping) {
-        this.stopping = false; this.standing = true; this.squareTries = 2; this.state = 'STAND';
-        /* CATCH COOLDOWN (MK1.40.0). A catch step that lands is itself a disturbance --
-           the swing leg's momentum -- and letting the next catch fire immediately turned
-           recovery into a limit cycle: DCM error alternating sign with growth, two catches
-           0.65 s apart and down (log s20260730185950, 12.9 s). Half a sway period of
-           mandatory settling before the STAND trigger may fire again; the ankles, gyro
-           and TMD own the error until then. The driver's own commands are not gated. */
-        this.catchCool = Math.PI / Math.sqrt(this.k.gravity / Math.max(1e-4, st.com.y));
-      }
+      /* The MK1.40.0 catch COOLDOWN was tried here and REMOVED in MK1.42.0. It gated the
+         STAND catch for half a sway period after every landing -- and the very next
+         session showed the failure the gate creates: 0.6 s of RED standing with up
+         degrading 0.976 -> 0.856 while the only working recovery was forbidden, then a
+         too-late catch into a doubled error (log s20260730200257, both falls). A cooldown
+         that holds while the capture point is genuinely outside the ankle box gates the
+         only mechanism that can act. The overshoot ringing it was meant to break is
+         kCapture 0.65's job (presets.js, Scout), which this removal finally tests alone. */
+      if (this.stopping) { this.stopping = false; this.standing = true; this.squareTries = 2; this.state = 'STAND'; }
       else if (!this.wantsMove()) {
         if (this.k.closeOnStop) { this.stopping = true; this.closeStep(st); }
         else { this.standing = true; this.state = 'STAND'; }
