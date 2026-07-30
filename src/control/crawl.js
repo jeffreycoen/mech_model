@@ -134,6 +134,32 @@ class CrawlController extends Chassis {
      Working off the MEASURED planted points rather than the nominal rectangle is what makes
      this survive turning, where the footprint pattern skews relative to the body and the
      critical edge is no longer the geometric diagonal. */
+  /* Signed margin from a world point to the boundary of the CURRENT support polygon --
+     the planted feet, excluding whatever `lift` says is (about to be) airborne. Positive
+     inside, negative outside. Instrumentation for the capturability light (MK1.40.0):
+     a statically-walking machine has no catch step, so once the capture point leaves this
+     polygon nothing recovers it -- that IS red on a quad. Points are convex-ordered by
+     angle about their centroid because rig.sides order (FL,FR,RL,RR) draws a bowtie. */
+  supportMargin(px, pz) {
+    const up = this.lift ? (Array.isArray(this.lift) ? this.lift : [this.lift]) : [];
+    const pts = [];
+    for (const s of this.rig.sides) if (up.indexOf(s) < 0) pts.push(this.plant[s]);
+    if (pts.length < 3) return 0;
+    const cx = pts.reduce((a, p) => a + p.x, 0) / pts.length,
+          cz = pts.reduce((a, p) => a + p.z, 0) / pts.length;
+    pts.sort((a, b) => Math.atan2(a.z - cz, a.x - cx) - Math.atan2(b.z - cz, b.x - cx));
+    let m = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const A = pts[i], B = pts[(i + 1) % pts.length];
+      let nx = -(B.z - A.z), nz = (B.x - A.x);
+      const len = Math.hypot(nx, nz); if (len < 1e-9) continue;
+      nx /= len; nz /= len;
+      if ((cx - A.x) * nx + (cz - A.z) * nz < 0) { nx = -nx; nz = -nz; }
+      m = Math.min(m, (px - A.x) * nx + (pz - A.z) * nz);
+    }
+    return m === Infinity ? 0 : m;
+  }
+
   shiftTarget(lift, from) {
     const pts = [];
     const up = Array.isArray(lift) ? lift : [lift];
@@ -323,10 +349,11 @@ class CrawlController extends Chassis {
     if (this.phase === 'SWING') {
       swing = this.lift;
       const u = clamp(this.tPhase / this.k.tSwing, 0, 1), e = smooth(u);
+      // Profile lives in chassis.js swingLift() -- one site, shared with gait.js.
       for (const w of this.lift) {
         const a = this.liftFrom[w], b = this.swingTo[w];
         feet[w] = V(a.x + (b.x - a.x) * e,
-                    a.y + Math.sin(Math.PI * u) * this.k.stepHeight,
+                    a.y + swingLift(u, this.k.stepHeight),
                     a.z + (b.z - a.z) * e);
       }
       this.state = 'SWING-' + this.lift.join('');

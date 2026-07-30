@@ -21,7 +21,7 @@
 import {buildSim} from './harness.mjs';
 const S=await import(buildSim());
 const {World,assembleMech,groundRig,rigStats,setGravity,V,PRESETS,applyPreset,
-       buildRig,DISPLAY_H}=S;
+       buildRig,DISPLAY_H,groundTruthState,swingLift}=S;
 const SPECS={atst:S.ATST_SPEC,atat:S.ATAT_SPEC};
 
 /* The one display height that ships. It is a SIM fact -- it sets the scale, hence SIM_DT
@@ -120,7 +120,9 @@ for(const b of RIGS){
    because both happened to read 20 deg. */
 console.log('\nI3  turnRate * step period == yawPerStep');
 for(const b of RIGS){
-  const d=b.dg, T=d.tSS+d.tDS, got=d.turnRate*T;
+  // stepPeriod, not tSS+tDS: the quad's crawl runs its own 2.75x tempo (MK1.40.0) and
+  // turnRate derives from the period a step ACTUALLY takes on that rig.
+  const d=b.dg, T=d.stepPeriod, got=d.turnRate*T;
   P(`${b.p.label}`, Math.abs(got-d.yawPerStep)/d.yawPerStep<0.02,
     `${(got*57.2958).toFixed(2)} deg`, `${(d.yawPerStep*57.2958).toFixed(2)} deg`);
 }
@@ -219,6 +221,258 @@ for(const b of RIGS){
     if(s>worst){ worst=s; wname=n; }
   }
   P(`${b.p.label} worst joint (${wname})`, worst<2, `kd*h/I ${worst.toFixed(2)}`, '< 2');
+}
+
+/* ---- I9. The orifice damper obeys the same explicit-stability rule ----------------------
+   The kv term (-kv*wRel*|wRel|, added MK1.27.0) is explicit exactly like kd: wRel is frozen
+   across the substep's iterations, so the effective damper slope is kd + 2*kv*|w| and the I8
+   rule is rate-dependent. assemble.js caps kd at ONE site; kv is applied by applyPreset AFTER
+   assembly and nothing capped it -- it was stable only because legInertia*3 landed in the same
+   preset (review finding, MK1.33.0). The worst PRE-CLAMP rate is where the kv torque alone
+   reaches tauMax, wTau = sqrt(tauMax/kv); past it the tauMax clamp bounds the impulse and the
+   failure mode is bang-bang chatter, not divergence. So assert the slope at wTau:
+   (kd + 2*sqrt(tauMax*kv)) * h / I < 2. Scale-free: kd, sqrt(tauMax*kv) both go as s^4*sqrt(s). */
+console.log('\nI9  (kd + 2*sqrt(tauMax*kv))*h/I < 2 where kv > 0 (orifice damper stability)');
+for(const b of RIGS){
+  const h=(1/60)*Math.sqrt(b.sc)/10;
+  let worst=0, wname='', any=false;
+  for(const [n,j] of Object.entries(b.r.joints)){
+    if(!j.kv||!j.b||!j.b.I) continue;
+    any=true;
+    const a=j.axisA, M=j.b.I;
+    const Ia=[M[0]*a.x+M[1]*a.y+M[2]*a.z, M[3]*a.x+M[4]*a.y+M[5]*a.z, M[6]*a.x+M[7]*a.y+M[8]*a.z];
+    const I=Math.abs(a.x*Ia[0]+a.y*Ia[1]+a.z*Ia[2])||1e-12;
+    const s=(j.kd+2*Math.sqrt(j.tauMax*j.kv))*h/I;
+    if(s>worst){ worst=s; wname=n; }
+  }
+  if(any) P(`${b.p.label} worst joint (${wname})`, worst<2, `slope*h/I ${worst.toFixed(2)}`, '< 2');
+  else console.log(`  --    ${b.p.label} has no kv joints`);
+}
+
+/* ---- I10. Catch-step geometry: can one step reach where STAND decides it must go? ------
+   CATCH STEP FROM STAND (gait.js, the block by that name) fires when the lateral capture
+   error exceeds copLimitZ + halfStance -- past that, no CoP command can arrest the fall and
+   stepping is the only recovery. But the step it takes is bounded by the SAME splay clamp
+   that caps every lateral placement (the "Splay bound" block in gait.js): outboard of
+   nominal stance by at most splayMax*2*halfStance, i.e. (splayMax-1)*2*halfStance beyond
+   where the feet already are. If the trigger distance exceeds what one step can deliver,
+   the machine can decide it must move further than the recovery mechanism can move it --
+   a real, measured shortfall (see the ratio below), not a regression this gate is meant to
+   hold the line on, so it WARNs rather than FAILs.
+   halfStance is set by GaitController.init(), which is pure geometry off the assembled
+   feet -- no stepping -- so it is built fresh here rather than reused off RIGS to avoid
+   mutating the shared controller instance's standing/plant state for whatever runs after. */
+console.log('\nI10 catch-step: trigger distance vs one step\'s splay-clamped reach');
+for(const key of ['light','atst']){
+  const B=buildRig(key,{height:H});
+  const st=groundTruthState(B.rig,B.world);
+  B.gait.init(st);
+  const g=B.gait;
+  const trigger=g.balance.k.copLimitZ+g.halfStance;
+  const deliverable=(g.k.splayMax-1)*2*g.halfStance;
+  W(`${PRESETS[key].label} one-step reach >= catch trigger`, deliverable>=trigger,
+    `${(deliverable/trigger).toFixed(3)}x`,
+    `(trigger ${(trigger*1e3).toFixed(1)} mm, one step ${(deliverable*1e3).toFixed(1)} mm)`);
+}
+
+/* ---- I11. Swing-foot touchdown velocity ------------------------------------------------
+   swingLift(s,h) = sin(pi*s)^2 * h, ONE site shared by gait.js and crawl.js (see the note at
+   its definition in chassis.js) -- asserted on the function itself so a copy anywhere else
+   could never silently diverge from what this checks. sin^2 replaced a bare sin because
+   sin's slope is steepest exactly at s=1, so the foot arrived at its MAXIMUM downward speed
+   at touchdown; substep contact telemetry read 1.5 W p95 / 3.2 W peak on landings before the
+   fix. Central finite difference at s=0.999 against the mid-swing slope at s=0.25 as the
+   reference peak. */
+console.log('\nI11 swingLift touchdown slope (central difference)');
+{
+  const h=0.14, eps=1e-4;
+  const slope=(s)=>(swingLift(s+eps,h)-swingLift(s-eps,h))/(2*eps);
+  const mid=slope(0.25), end=slope(0.999);
+  P('swingLift touchdown slope < 2% of mid-swing peak', Math.abs(end)<0.02*Math.abs(mid),
+    `${(Math.abs(end/mid)*100).toFixed(2)}%`, '< 2%');
+  P('swingLift(0,h) == 0', swingLift(0,h)===0, `${swingLift(0,h)}`, '0');
+  P('swingLift(1,h) ~= 0', Math.abs(swingLift(1,h))<1e-9, `${swingLift(1,h).toExponential(2)}`, '~0');
+}
+
+/* ---- I12. Ground compliance sink is in range and Froude-invariant ---------------------
+   world.contacts.compliance is derived in rig/build.js as 0.01*(thigh+shin)/(mass*g), sized
+   so one bodyweight of load sinks 1% of leg length. Checked directly against the sink it
+   produces -- mass*g*compliance -- which must land between 0.5% and 2% of leg length, and
+   must be the SAME fraction at any display height: compliance goes as s/s^3 = s^-2, exactly
+   cancelling mass*g's s^3, so sink/L is scale-free by construction. This asserts that
+   construction against arithmetic instead of leaving it as a comment. */
+console.log('\nI12 ground compliance sink: 0.5-2% of leg length, Froude-invariant across height');
+for(const key of ['light','atst','atat']){
+  const label=PRESETS[key].label, at={};
+  for(const hh of [H,1.20]){
+    const B=buildRig(key,{height:hh});
+    let mass=0; for(const bd of Object.values(B.rig.bodies)) mass+=bd.mass;
+    const L=B.rig.leg.thigh+B.rig.leg.shin;
+    at[hh]={frac:(mass*G*B.world.contacts.compliance)/L, damp:B.world.contacts.damp};
+  }
+  const f30=at[H].frac, f120=at[1.20].frac;
+  P(`${label} sink/L in range at ${H} m`, f30>0.005&&f30<0.02, `${(f30*100).toFixed(3)}%`, '0.5-2%');
+  P(`${label} sink/L Froude-invariant (${H} vs 1.20 m)`,
+    Math.abs(f30-f120)/f30<1e-6, `${(Math.abs(f30-f120)/Math.max(f30,1e-300)).toExponential(1)}`, '< 1e-6 rel');
+  P(`${label} contacts.damp > 0`, at[H].damp>0 && at[1.20].damp>0, `${at[H].damp}`, '> 0');
+}
+
+/* ---- I13. Mount torsion vs tauMax on the single-leg-sizing joints (Light Frame) --------
+   mech.js's design note claims tauMax/lim.torsion = 0.73 survives the single-leg-sizing
+   change, stated against the RAW MECH_SPEC table (hipYoke 140e3/190e3, thigh & shin
+   190e3/260e3 -- hipYaw itself is 120e3/220e3 = 0.545 even there, already off-note).
+   That note predates two multipliers that land on the LIGHT preset specifically and touch
+   only one side of the ratio: presets.js applies torque:0.5 to tauMax and envelope:0.7 to
+   lim.torsion (factor 0.5/0.7 on the ratio), then rig/build.js's FORGIVE=4 multiplies every
+   lim by 4 AFTER presets (factor 1/4) -- neither is mentioned by the 0.73 note. Measured
+   here on the built rig exactly as driven, not forced to agree with the note. */
+console.log('\nI13 tauMax/lim.torsion on the four proximal leg joints (Light Frame; design note: 0.73)');
+{
+  const b=RIGS.find(x=>x.key==='light');
+  for(const base of ['hipYaw','hipYoke','thigh','shin']){
+    for(const side of ['L','R']){
+      const j=b.r.joints[base+side];
+      if(!j) continue;
+      const ratio=j.tauMax/j.lim.torsion;
+      W(`${b.p.label} ${base}${side}`, Math.abs(ratio-0.73)/0.73<0.05,
+        `${ratio.toFixed(3)}`, 'want ~0.73 (+/-5%)');
+    }
+  }
+}
+
+/* ---- I14. Arm tuned-mass-damper tuning (Light Frame) ----------------------------------
+   NOT a call into deriveArmTMD. The first version was: it compared buildRig's applied
+   gains against the same function's output -- structurally circular, and it printed
+   0.0e+0 while an indexing bug inside that function was zeroing every arm segment's own
+   inertia (b.I[2] read as if the flat 3x3 were a 3-vector; it is Ixz, identically 0 for
+   a box). The review caught the bug; this gate had certified it.
+   So this is a SECOND implementation, written independently on purpose: box Izz straight
+   from m/12*(dx^2+dy^2), parallel axis from the assembled anchor geometry, Den Hartog
+   mu/wT/zeta from masses and dg.omega, kd at the achieved frequency, kv from the I9
+   half-cap form build.js uses. A bug in either implementation now fails the match. */
+console.log('\nI14 arm TMD tuning vs independent re-derivation (Light Frame)');
+{
+  const b=RIGS.find(x=>x.key==='light');
+  if(!b.r.joints.upperArmL) console.log('  --    no arms on this rig');
+  else{
+    let mach=0; for(const bd of Object.values(b.r.bodies)) mach+=bd.mass;
+    const armM=['upperArmL','foreArmL','upperArmR','foreArmR']
+      .reduce((a,n)=>a+b.r.bodies[n].mass,0);
+    /* omega recomputed HERE from a manual COM sum -- NOT dg.omega, which deriveGait
+       froze before fitCMG added the flywheel; the derive functions read the live rig and
+       so must this check, independently (review finding, MK1.38.0). */
+    let my=0; for(const bd of Object.values(b.r.bodies)) my+=bd.mass*bd.x.y;
+    const om=Math.sqrt(G/(my/mach));
+    const mu=armM/(mach-armM), wT=om/(1+mu),
+          zeta=Math.sqrt(3*mu/(8*Math.pow(1+mu,3)));
+    P('mu in (0,1)', mu>0&&mu<1, mu.toFixed(3));
+    P('wT below body sway omega', wT<om,
+      `${wT.toFixed(2)} vs ${om.toFixed(2)} rad/s`);
+    P('zeta in (0,1)', zeta>0&&zeta<1, zeta.toFixed(3));
+    const izz=bd=>bd.mass/12*(bd.dim.x*bd.dim.x+bd.dim.y*bd.dim.y);
+    const h=(1/60)*Math.sqrt(b.sc)/10;
+    let worst=0, wn='', wAsh=0, wAel=0;
+    for(const side of ['L','R']){
+      const up=b.r.bodies['upperArm'+side], fo=b.r.bodies['foreArm'+side];
+      const sj=b.r.joints['upperArm'+side], ej=b.r.joints['foreArm'+side];
+      const aS=up.toWorld(sj.rb), aE=fo.toWorld(ej.rb);
+      const dUp=Math.hypot(up.x.x-aS.x,up.x.y-aS.y);
+      const dFS=Math.hypot(fo.x.x-aS.x,fo.x.y-aS.y);
+      const dFE=Math.hypot(fo.x.x-aE.x,fo.x.y-aE.y);
+      const Ish=izz(up)+up.mass*dUp*dUp+izz(fo)+fo.mass*dFS*dFS;
+      const Iel=izz(fo)+fo.mass*dFE*dFE;
+      const lcS=(up.mass*dUp+fo.mass*dFS)/(up.mass+fo.mass);
+      const want={};
+      {
+        const kp=Math.max(0,wT*wT*Ish-(up.mass+fo.mass)*G*lcS);
+        const wA=Math.sqrt((kp+(up.mass+fo.mass)*G*lcS)/Ish);
+        want['upperArm'+side]={kp,kd:2*zeta*wA*Ish,I:izz(up)}; wAsh=wA;
+      }
+      {
+        const kp=Math.max(0,wT*wT*Iel-fo.mass*G*dFE);
+        const wA=Math.sqrt((kp+fo.mass*G*dFE)/Iel);
+        want['foreArm'+side]={kp,kd:2*zeta*wA*Iel,I:izz(fo)}; wAel=wA;
+      }
+      for(const [n,w2] of Object.entries(want)){
+        const j=b.r.joints[n];
+        for(const k of ['kp','kd']){
+          const d=Math.abs(j[k]-w2[k])/Math.max(1e-12,Math.max(Math.abs(w2[k]),1e-12));
+          if(d>worst&&(w2[k]>1e-12||j[k]>1e-12)){ worst=d; wn=`${n}.${k}`; }
+        }
+        // kv: the I9 half-cap form build.js applies, recomputed here from box Izz
+        const room=Math.max(0,0.9*(2*w2.I/h-j.kd)/2);
+        const kvWant=0.5*room*room/j.tauMax;
+        const dv=Math.abs(j.kv-kvWant)/Math.max(1e-12,kvWant);
+        if(dv>worst){ worst=dv; wn=`${n}.kv`; }
+      }
+    }
+    console.log(`        achieved wA/wT: shoulder ${(wAsh/wT).toFixed(2)}x  elbow ${(wAel/wT).toFixed(2)}x   (1.00 = exact Den Hartog; gravity floor prevents lower)`);
+    P(`applied matches independent derivation (worst ${wn})`, worst<1e-6,
+      worst.toExponential(1), '< 1e-6 rel');
+  }
+}
+
+/* ---- I15. Gimbal TMD tuning vs independent re-derivation (Scout) -----------------------
+   Same discipline as I14 and for the same reason: a check that shares its arithmetic with
+   the apply path certifies its own bugs. Second implementation on purpose -- box inertia
+   straight from dims (Ixx = m/12*(dy^2+dz^2) for the roll axis, Izz = m/12*(dx^2+dy^2)
+   for pitch), parallel axis and gravity lever from the assembled anchors, inverted-bob
+   sign (kp = wT^2*I + m*g*lc, gravity DESTABILISES so it adds spring), kv from the I9
+   half-cap form. Also asserts the achieved frequency IS the Den Hartog target on both
+   axes -- the whole point of the inverted layout. */
+console.log('\nI15 gimbal TMD tuning vs independent re-derivation (Scout)');
+{
+  const b=RIGS.find(x=>x.key==='atst');
+  if(!b.r.joints.tmdRing) console.log('  --    no gimbal TMD on this rig');
+  else{
+    const ring=b.r.bodies.tmdRing, bob=b.r.bodies.tmdBob;
+    const rj=b.r.joints.tmdRing, bj=b.r.joints.tmdBob;
+    let mach=0; for(const bd of Object.values(b.r.bodies)) mach+=bd.mass;
+    const tm=ring.mass+bob.mass, mu=tm/(mach-tm);
+    // Independent omega, same reasoning as I14: manual COM sum on the live rig.
+    let my=0; for(const bd of Object.values(b.r.bodies)) my+=bd.mass*bd.x.y;
+    const om=Math.sqrt(G/(my/mach));
+    const wT=om/(1+mu), zeta=Math.sqrt(3*mu/(8*Math.pow(1+mu,3)));
+    P('mu in (0,1)', mu>0&&mu<1, mu.toFixed(3));
+    P('zeta in (0,1)', zeta>0&&zeta<1, zeta.toFixed(3));
+    const h=(1/60)*Math.sqrt(b.sc)/10;
+    const ixx=bd=>bd.mass/12*(bd.dim.y*bd.dim.y+bd.dim.z*bd.dim.z);
+    const izz=bd=>bd.mass/12*(bd.dim.x*bd.dim.x+bd.dim.y*bd.dim.y);
+    let worst=0, wn='';
+    const chk=(n,j,I,lc,m,Iown)=>{
+      const kp=wT*wT*I+m*G*lc, kd=2*zeta*wT*I;
+      for(const [k,w2] of [['kp',kp],['kd',kd]]){
+        const d=Math.abs(j[k]-w2)/Math.max(1e-12,w2);
+        if(d>worst){ worst=d; wn=`${n}.${k}`; }
+      }
+      const room=Math.max(0,0.9*(2*Iown/h-j.kd)/2);
+      const kvW=0.5*room*room/j.tauMax;
+      const dv=Math.abs(j.kv-kvW)/Math.max(1e-12,kvW);
+      if(dv>worst){ worst=dv; wn=`${n}.kv`; }
+      /* The first version also asserted wA == wT here, computed from the SAME I/lc/m the
+         kp check three lines up already used -- algebraically identical to that check,
+         i.e. an assertion that could never fail independently (review finding). Removed.
+         What IS independently checkable: the fixed spec tauMax must cover the derived
+         spring at the end stop with margin, or the absorber clips exactly when it works
+         hardest. */
+      const range=Math.abs(b.r.table[n].range[1]);
+      P(`${n} tauMax covers spring at end stop x2`, j.tauMax>2*j.kp*range,
+        `${(j.tauMax/(j.kp*range)).toFixed(1)}x`, '> 2x');
+      return Math.sqrt((j.kp-m*G*lc)/I);
+    };
+    const aR=ring.toWorld(rj.rb);
+    const dR=ring.x.y-aR.y, dB=bob.x.y-aR.y;
+    const Iroll=ixx(ring)+ring.mass*dR*dR+ixx(bob)+bob.mass*dB*dB;
+    const lcR=(ring.mass*dR+bob.mass*dB)/tm;
+    const wA1=chk('tmdRing',rj,Iroll,lcR,tm,ixx(ring));
+    const aB=bob.toWorld(bj.rb);
+    const dBE=bob.x.y-aB.y;
+    const Ipitch=izz(bob)+bob.mass*dBE*dBE;
+    const wA2=chk('tmdBob',bj,Ipitch,dBE,bob.mass,izz(bob));
+    console.log(`        achieved w/wT: roll ${(wA1/wT).toFixed(4)}  pitch ${(wA2/wT).toFixed(4)}   (1.0000 = exact Den Hartog, both axes)`);
+    P(`applied matches independent derivation (worst ${wn})`, worst<1e-6,
+      worst.toExponential(1), '< 1e-6 rel');
+  }
 }
 
 console.log(`\n${pass} passed, ${fail} failed, ${warn} warnings\n`);

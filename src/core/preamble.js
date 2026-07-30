@@ -15,7 +15,7 @@
    telemetry members added -- so two logs with incompatible schemas both claimed MK1.11.0 and the
    only way to tell them apart was counting fields. A driving session was then diagnosed against
    the wrong build. The rule above is not decoration. */
-const BUILD = 'MK1.25.0';
+const BUILD = 'MK1.40.0';
 const BUILD_MODEL = 'opus-5-1m';
 const BUILD_TAG = BUILD + '-' + BUILD_MODEL;
 const BUILD_TITLE = 'MK1 Live Rig ' + BUILD + ' — Claude Opus 5 (1M context)';

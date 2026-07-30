@@ -11,6 +11,14 @@
    What is NOT here is anything about how feet get placed. That is what actually differs
    between a biped running a DCM plan and a quadruped running a static crawl. */
 
+/* Swing-foot lift profile, ONE site -- gait.js and crawl.js both call this, and invariant
+   I11 asserts its touchdown property on the function itself rather than on a copy.
+   sin^2, not sin: sin's slope is steepest at s=1, so the foot arrived at its MAXIMUM
+   downward speed exactly at touchdown -- substep contact telemetry read 1.5 W p95 / 3.2 W
+   peak on landings. sin^2 has zero slope at both ends: smooth lift, zero commanded
+   vertical speed at touchdown. */
+function swingLift(s, h) { const p = Math.sin(Math.PI * s); return p * p * h; }
+
 const CHASSIS_DEFAULTS = {
   gravity: 9.81,       // must match the world; the LIPM frequency depends on it
   enabled: true,

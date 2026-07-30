@@ -21,7 +21,14 @@ const PRESETS = {
      that loop authority, this rig -- the only one at 0.60 -- was the only one being thrown:
      199 mm/s of body speed against a 4 mm/s command, 48.5x, where the Scout and Heavy
      tracked theirs at 0.8x and 0.7x. */
+  /* armTMD (MK1.37.0): the arms are retuned by buildRig as passive tuned mass dampers --
+     Den Hartog spring/damper computed by deriveArmTMD() in rig/derive.js, which is the
+     one site; see the note there. The stiff-servo arms it replaces were the machine's
+     measured oscillation amplifier (upperArm ringing 460-1166 deg/s, saturation pinned,
+     mounts torn in every recent fall). tauMax is untouched -- authority for extremes,
+     not for holding a pose stiffly. */
   light:{ label:'Light Frame', mass:0.5, torque:0.5, gain:0.5, envelope:0.7, kCop:0.40,
+    armTMD:true,
     /* Gyro on the HULL. This was the only rig still reacting its flywheel against a body
        that is not its heaviest -- torso 157 g against pelvis 373 g as driven -- and the
        torso is what the arms and head hang off, so the reaction went straight into the
@@ -40,7 +47,16 @@ const PRESETS = {
      Both endpoints are measured on this rig by the same driver: gamma 36 stood at 36 mm/s
      and walked at 62% of command, gamma 6 stands at 161 and walks at 123%. 15 is the
      geometric midpoint of two measured points rather than a guess in either direction. */
-  atst:{ label:'Scout Walker', spec:'atst', kCop:0.40, gamma:15,
+  /* gimbalTMD (MK1.38.0): buildRig tunes the internal absorber's two hinges from
+     deriveGimbalTMD() -- see rig/atst.js for the hardware and rig/derive.js for the law. */
+  /* kCapture 0.65, this rig only (MK1.40.0). At 1.0 every catch step overcorrected and
+     the DCM error ALTERNATED SIGN with growth: +0.11 -> -0.25 -> -0.37 and down (log
+     s20260730185950, fall at 12.9 s; same signature at 10.1 s). The swing leg is ~30% of
+     this machine and the point-mass planner never sees its momentum, so a full-error
+     catch throws harder than it catches. 0.65 catches most of the error and lets the
+     next step converge instead of ringing. */
+  atst:{ label:'Scout Walker', spec:'atst', kCop:0.40, gamma:15, kv:500, legInertia:3,
+    gimbalTMD:true, gait:{kCapture:0.65},
     /* Gyro moved torso -> pelvis with the cockpit halving. 03-sim.js already records the
        failure this avoids: "flywheel heavier than the torso it was bolted into. It tore
        the rig on contact." A 260 kg flywheel in a 525 kg cockpit is 50% of it, and
@@ -52,14 +68,15 @@ const PRESETS = {
        margin in it. */
     cmg:{mass:260, tauMax:90e3, hMax:4.4e4, kp:300e3, kd:84e3, mount:'pelvis'},
     steps:'rough build at 1/5 scale &mdash; smoke-tested only, not qualified',
-    note:'Scout-walker proportions with a <b>half-scale cockpit</b>: every linear dimension of the torso and head halved and the mass taken with the volume, 4 200 &rarr; 525 kg. The machine is 4 333 kg carried 7.32 m up, <b>COM at 53% of height</b> against the old 65% and MK1&rsquo;s 60% &mdash; the pelvis is now its heaviest single body, so the gyro mounts there. Walks unassisted at 3/3 with peak mount load of only 28%, so it has margin in hand. An earlier build of this rig put a 3.6 m-wide cockpit on 0.72 m-wide thighs and could not walk at all without the gyro &mdash; that was a proportion error on my part, not a property of the silhouette. Mount envelopes are 3&times; a naive scaling by leg length: at 1.8&times; the hip yoke tore 0.45 s into simply standing up, because moments about the mounts grow far faster than leg length.' },
-  /* TROT, not the static crawl. Diagonal pairs -- FL with RR, FR with RL -- so two feet
-     are down instead of three. It halves the number of steps and doubles ground covered per
-     stride, and it gives up the static guarantee: the two support feet make a LINE that
-     passes through the body centre, so there is no margin either side of it and roll about
-     that diagonal is held by the stabiliser rather than by geometry. The crawl is still
-     there, one word away, if this trades badly. */
-  atat:{ label:'Heavy Walker', spec:'atat', kCop:0.40, gait:{order:TROT_ORDER},
+    note:'Scout-walker proportions with a <b>half-scale cockpit</b>: every linear dimension of the torso and head halved and the mass taken with the volume, 4 200 &rarr; 525 kg. The machine is 4 475 kg carried 7.32 m up (4 333 + the 142 kg internal absorber), <b>COM at 53% of height</b> against the old 65% and MK1&rsquo;s 60% &mdash; the pelvis is now its heaviest single body, so the gyro mounts there. Walks unassisted at 3/3 with peak mount load of only 28%, so it has margin in hand. An earlier build of this rig put a 3.6 m-wide cockpit on 0.72 m-wide thighs and could not walk at all without the gyro &mdash; that was a proportion error on my part, not a property of the silhouette. Mount envelopes are 3&times; a naive scaling by leg length: at 1.8&times; the hip yoke tore 0.45 s into simply standing up, because moments about the mounts grow far faster than leg length.' },
+  /* STATIC CRAWL again (MK1.38.0). The trot -- diagonal pairs, two feet down -- was tried
+     and the note above it promised "the crawl is still there, one word away, if this
+     trades badly". It traded badly, measured: every trot fall in logs s20260730011112 to
+     s20260730180931 shows 0.4-0.6 s windows with ALL FOUR contact forces at zero -- the
+     gait had a flight phase, the machine was pronking -- with single-foot landings at
+     1.4-1.6 W, falls at 5-9 steps, and the torso+head pair torn at the fall in six of
+     six. Three feet down cannot go airborne. */
+  atat:{ label:'Heavy Walker', spec:'atat', kCop:0.40,
     /* Gyro, mounted on the HULL and not on the neck ring -- see fitCMG. Sized off the
        Scout by righting moment, which goes as mass x height: 17 840 x 7.00 against
        8 200 x 8.47 is 1.798x, so 90e3 -> 162e3 N.m, 300e3 -> 540e3, 84e3 -> 151e3,
@@ -97,7 +114,33 @@ function applyPreset(rig,p){
     if(p.inertia){ j.kp*=p.inertia; j.kd*=p.inertia; }
     if(p.gain){ j.kp*=p.gain; j.kd*=p.gain; }
     if(p.envelope) for(const k of ['tension','shear','bend','torsion']) j.lim[k]*=p.envelope;
+    /* kv obeys the SAME explicit-damper stability rule assemble.js caps kd by. The
+       quadratic term's slope is kd + 2*kv*|w|, worst pre-clamp at wTau = sqrt(tauMax/kv),
+       so the bound is kd + 2*sqrt(tauMax*kv) < 2*I/h. Uncapped, kv=500 put the Scout
+       ankles at 2.46 -- 23% past divergence -- and was stable in MK1.27-32 only because
+       legInertia*3 shipped in the same preset (review finding). Capped HERE, the one site
+       kv is written, at 0.9 of the room; test/invariants.mjs I9 asserts the result.
+       Native scale on purpose: applyPreset runs before scaleRig and the ratio is
+       scale-free (kd and sqrt(tauMax*kv) both go as s^4*sqrt(s)). */
+    if(p.kv !== undefined){
+      const Ia=inertiaAbout(j.b, j.axisA);
+      const room=Math.max(0, 0.9*(2*Ia/H_NATIVE - j.kd)/2);
+      j.kv=Math.min(p.kv, room*room/j.tauMax);
+    }
   }
+  /* legInertia scales the LEG bodies' rotational inertia and their joints' kd together, so
+     kd*h/I -- the explicit-damper stability number assemble.js capped kd by -- is unchanged
+     while the damping RATIO rises by sqrt(legInertia). kp stays put: same static stiffness,
+     lower bandwidth. Shipping the inertia without the kd (MK1.29.0) dropped kd*h/I to 0.33
+     and the legs rang: idle-stand leg rate went 11 -> 40 deg/s mean against MK1.28.0. */
+  /* "hinged body" stopped meaning "leg body" when the gimbal TMD arrived (MK1.38.0):
+     tmdRing/tmdBob are hinges too, and tripling the ABSORBER's inertia would detune the
+     very thing deriveGimbalTMD tunes. Excluded by name prefix. */
+  if(p.legInertia) for(const [name,b] of Object.entries(rig.bodies))
+    if(name in rig.joints && !name.startsWith('tmd')){
+      b.I=b.I.map(v=>v*p.legInertia); b.invI=m3inv(b.I);
+      rig.joints[name].kd*=p.legInertia;
+    }
   for(const w of Object.values(rig.welds))
     if(p.envelope) for(const k of ['tension','shear','bend','torsion']) w.lim[k]*=p.envelope;
 }

@@ -30,6 +30,9 @@ class GaitController extends Chassis {
       tStart: 1.2, tEnd: 3.0,
       stepHeight: 0.14,
       kDCM: 2.0,           // DCM error feedback, >1 for stable error dynamics
+      kCapture: 1.0,       // capture-point step feedback: fraction of DCM error added to the foothold
+      capCommit: 0.5,      // swing fraction after which the catch target is FROZEN
+      capDeadband: 0.15,   // DCM error ignored below this fraction of strideCap
       copClamp: 0.45,      // how far the CoP may deviate from the planned ZMP, m
       trackMeasured: false, // reference-frame IK is correct: leg deflection IS the force
       replan: true,        // rebuild the plan from MEASURED feet at each touchdown
@@ -122,11 +125,22 @@ class GaitController extends Chassis {
      terminal double-support phase and brings the COM to a stop over `tEnd` rather than
      leaving it moving when the feet stop. `_closing` tells the swing-target code to aim
      alongside the stance foot instead of advancing from this foot's own last print. */
-  closeStep(st) {
+  /* Measured capture point, ONE site. The walk section evaluates it at the plan's omega
+     (the pendulum the references were built against); the STAND catch trigger evaluates
+     it at the live sqrt(g/comHeight), because in STAND there is no plan and the stale
+     plan's height is whatever the last walk crouched at. Different omegas on purpose;
+     the FORMULA lives here once. */
+  xiMeasured(st, om) {
+    return V(st.com.x + st.comVel.x / om, 0, st.com.z + st.comVel.z / om);
+  }
+
+  closeStep(st, side) {
     this.cmd.tx = 0; this.cmd.tz = 0;
     this.want.tx = 0; this.want.tz = 0;
     this.latch();
-    this.nextSwing = this.nextSwing === 'L' ? 'R' : 'L';
+    // A directed side means a CATCH step -- the caller knows which foot can reach the
+    // capture point. Undirected closes keep the alternation.
+    this.nextSwing = side || (this.nextSwing === 'L' ? 'R' : 'L');
     /* SCALE FIX: this floor used to be an absolute 1.0 m. Any rig shorter than about
        1.7 m has its COM below that, so the planner sized its inverted pendulum to a
        height the machine does not have -- at 1 ft the COM is 0.18 m and the planner was
@@ -219,13 +233,23 @@ class GaitController extends Chassis {
        heading never reached, at 1x, 3x, 5x and 8x turn rate. Turning in place had been
        recorded as "clean" purely because standing still cannot fall over. */
     const wantMove = this.wantsMove();
+    // Catch-step cooldown clock (MK1.40.0) -- armed at the touchdown of every completed
+    // stop/catch step, see below.
+    if (this.catchCool) this.catchCool = Math.max(0, this.catchCool - dt);
     /* Only a real TRAVEL command aborts a stop in progress. Aborting on any wantsMove()
        meant the yaw residual left over from the turn cancelled every close, so letting go
        of the stick after turning marched in place for ever instead of coming to rest. A
        driver who wants to keep going pushes the stick; a residual does not. A driver still
        asking for facing gets it one step later, out of STAND, which is survivable -- an
        abandoned close is not, because it parks the rig mid-lunge on one loaded ankle. */
-    if (this.stopping && this.speedCmd() > this.moveEps()) this.stopping = false;
+    /* ...and never mid-SWING. Closing steps are also CATCH steps now (the capture
+       correction applies to them), so flipping `stopping` while the foot is airborne
+       yanks its target from the square-up print to a full stride from its own last print
+       in one tick -- a step command into a command channel, at the moment the machine is
+       recovering (review finding, MK1.33.0). With both feet down a retarget is safe; the
+       stick is honoured at the next touchdown either way. */
+    if (this.stopping && this.speedCmd() > this.moveEps()
+        && !String(this.state).startsWith('SS')) this.stopping = false;
     if (this.standing) {
       if (wantMove) { this.standing = false; this._fromStand = true; this.rebuild(st); this._fromStand = false; }
       else {
@@ -239,6 +263,34 @@ class GaitController extends Chassis {
            the closing STEP that already exists and is already tested. squareTries caps it
            so a close that cannot converge cannot march for ever. */
         const b0 = this.basis();
+        /* CATCH STEP FROM STAND. Log s20260730014047, Scout fall at 32.95 s: the machine
+           caught its post-release momentum through four capture steps, reached STAND at
+           up 0.98, then toppled over 0.6 s with both feet planted, no saturation and no
+           response -- STAND had no stepping and the ankles alone could not hold it.
+           Stepping must be available in every state, triggered by need: if the capture
+           point xi = com + comVel/omega leaves the region the ankles can reach (the
+           copLimit box around the stance pair, halfStance wider laterally because the
+           feet stand apart), no CoP command can arrest the fall and the ONLY recovery is
+           a step. Launch the one-step machinery at the foot on the side the fall leads;
+           placement comes from the capture feedback in the swing block. The box is the
+           deadband -- inside it standing is stable and nothing fires. */
+        {
+          const zc = Math.max(1e-4, st.com.y);
+          const xi = this.xiMeasured(st, Math.sqrt(this.k.gravity / zc));
+          const midX = (this.plant.L.x + this.plant.R.x) / 2,
+                midZ = (this.plant.L.z + this.plant.R.z) / 2;
+          const exF = (xi.x - midX) * b0.fwd.x + (xi.z - midZ) * b0.fwd.z;
+          const exL = (xi.x - midX) * b0.left.x + (xi.z - midZ) * b0.left.z;
+          if ((Math.abs(exF) > this.balance.k.copLimitX
+               || Math.abs(exL) > this.balance.k.copLimitZ + this.halfStance)
+              && !this.catchCool) {
+            // No return: fall through to the walk section like the squaring path, so the
+            // fresh plan gets its posture command THIS tick.
+            this.standing = false; this.stopping = true;
+            this.closeStep(st, exL > 0 ? 'L' : 'R');
+          }
+        }
+        if (this.standing) {
         const fa = (this.plant.L.x - this.plant.R.x) * b0.fwd.x
                  + (this.plant.L.z - this.plant.R.z) * b0.fwd.z;
         if (Math.abs(fa) > this.k.squareTol * 2 * this.halfStance
@@ -247,7 +299,11 @@ class GaitController extends Chassis {
           this.standing = false; this.stopping = true;
           this.closeStep(st);
         } else {
-          this.squareTries = 0;
+          /* Reset the counter only when the pair actually IS square. Zeroing it
+             unconditionally here erased the touchdown's squareTries=2 latch one frame
+             after it was written, so the MK1.26 re-square suppression held for exactly
+             one STAND frame and the cap could never bind (review finding, MK1.33.0). */
+          if (Math.abs(fa) <= this.k.squareTol * 2 * this.halfStance) this.squareTries = 0;
           this.balance.copOverride = null;
           this.balance.update(st, dt);
           const mid = V((this.plant.L.x + this.plant.R.x) / 2, 0, (this.plant.L.z + this.plant.R.z) / 2);
@@ -261,6 +317,7 @@ class GaitController extends Chassis {
           this.debug = { state: 'STAND', steps: this.stepsTaken, rise: +(this.pelvisY).toFixed(4) };
           return;
         }
+        }
       }
     }
 
@@ -271,6 +328,8 @@ class GaitController extends Chassis {
     const { s, kind } = this.plan.phaseProgress(t);
     const zmpRef = this.plan.zmpAt(t);
     const xiRef = this.plan.xiAt(t);
+    // Measured DCM at the plan's omega -- formula lives in xiMeasured(), one site.
+    const xiMeas = this.xiMeasured(st, this.plan.omega);
 
     // --- swing foot ------------------------------------------------------------------
     const stance = kind.startsWith('SS-') ? kind.slice(3) : null;
@@ -309,6 +368,7 @@ class GaitController extends Chassis {
         this.centre = V(c.x + bb.fwd.x * dF, 0, c.z + bb.fwd.z * dF);
       }
       this.stepsTaken++;
+      this.capHold = null;   // next swing samples the DCM error fresh
       this.latch();
       /* Stopping is a manoeuvre, not the absence of one.
          Releasing the stick used to just ramp travel to zero, which leaves the swing foot
@@ -318,7 +378,16 @@ class GaitController extends Chassis {
          milliseconds after the stick was released, while the rig was still upright.
          Instead, take one CLOSING step that brings the trailing foot alongside the stance
          foot, then stand. */
-      if (this.stopping) { this.stopping = false; this.standing = true; this.state = 'STAND'; }
+      if (this.stopping) {
+        this.stopping = false; this.standing = true; this.squareTries = 2; this.state = 'STAND';
+        /* CATCH COOLDOWN (MK1.40.0). A catch step that lands is itself a disturbance --
+           the swing leg's momentum -- and letting the next catch fire immediately turned
+           recovery into a limit cycle: DCM error alternating sign with growth, two catches
+           0.65 s apart and down (log s20260730185950, 12.9 s). Half a sway period of
+           mandatory settling before the STAND trigger may fire again; the ankles, gyro
+           and TMD own the error until then. The driver's own commands are not gated. */
+        this.catchCool = Math.PI / Math.sqrt(this.k.gravity / Math.max(1e-4, st.com.y));
+      }
       else if (!this.wantsMove()) {
         if (this.k.closeOnStop) { this.stopping = true; this.closeStep(st); }
         else { this.standing = true; this.state = 'STAND'; }
@@ -330,7 +399,9 @@ class GaitController extends Chassis {
     const feet = { L: this.plant.L, R: this.plant.R };
     if (swing) {
       const from = this.plant[swing];
-      const lift = Math.sin(Math.PI * s) * this.k.stepHeight;
+      // Profile lives in chassis.js swingLift() -- one site, shared with crawl.js,
+      // asserted by invariant I11.
+      const lift = swingLift(s, this.k.stepHeight);
       const b = this.basis(), sv = this.strideVec();
       const other = this.plant[swing === 'L' ? 'R' : 'L'];
       const sign = swing === 'L' ? 1 : -1;
@@ -360,6 +431,32 @@ class GaitController extends Chassis {
       // Closing step: square up on the stance foot instead of advancing from this foot's
       // own print, which is a full stride behind and would leave the rig parked in a lunge.
       if (this.stopping) { tx = nomX; tz = nomZ; }
+      /* CAPTURE-POINT STEP FEEDBACK. The DCM error is how far the capture point has run
+         ahead of the plan; landing the swing foot there is what absorbs the fall. Until
+         MK1.31.0 that error fed only the ankle CoP command, clamped to a patch of the
+         foot, so the feet went where the stick said while the machine fell -- the logged
+         26-80-steps-then-fall pattern. Step INTO the fall instead.
+         COMMITTED AT MID-SWING, not chased. MK1.31.0 fed the live error all the way to
+         touchdown, and at smooth(s) -> 1 the foot tracks its target 1:1, so every catch
+         landed with the error's own sideways velocity and overshot; with a half-step of
+         phase lag the correction turned into positive feedback. Log s20260730013208 shows
+         the signature: rms DCM error steady at 17-27 mm for six seconds, then 74 -> 103 mm
+         over four steps and down. Track while s < capCommit, freeze after, land settled.
+         The deadband keeps standing wobble from walking the footholds around.
+         Placed AFTER the closing-step override so a stop is caught too, and BEFORE the
+         pinch/splay clamps so a catch step can never cross the stance foot or tear the
+         splay. Bounded by the rig's own stride cap. */
+      if (s < this.k.capCommit || !this.capHold) {
+        let capX = this.k.kCapture * (xiMeas.x - xiRef.x),
+            capZ = this.k.kCapture * (xiMeas.z - xiRef.z);
+        const m = Math.hypot(capX, capZ), db = this.k.capDeadband * this.k.strideCap;
+        const sc = m > 1e-9 ? Math.max(0, m - db) / m : 0;
+        capX *= sc; capZ *= sc;
+        const capM = Math.hypot(capX, capZ);
+        if (capM > this.k.strideCap) { capX *= this.k.strideCap / capM; capZ *= this.k.strideCap / capM; }
+        this.capHold = { x: capX, z: capZ };
+      }
+      tx += this.capHold.x; tz += this.capHold.z;
       // Never COMMAND a placement the feet cannot physically occupy. The solver now
       // refuses to let them interpenetrate, so a planner that keeps asking just fights
       // the constraint and falls over -- which is what turning did.
@@ -382,7 +479,14 @@ class GaitController extends Chassis {
          open the pair by the commanded LATERAL stride and the pinch clamp above closes it
          on the next -- step out, step together, which is how a person side-steps. The hard
          ceiling stays below the 1.6x that tore the leg, with margin. */
-      const latStride = Math.abs(sv.x * b.left.x + sv.z * b.left.z);
+      /* The catch correction IS a commanded lateral stride, so it earns the same one-step
+         splay headroom the stick gets. Without this term a lateral catch had 0.04 m native
+         of outboard room on the Scout (review finding, MK1.33.0): with latStride 0 -- always
+         true during a closing/catch step -- maxSep sat 0.04 m over nominal stance, so the
+         one direction the machine actually falls was the one direction it could not step.
+         splayMax still caps the total, well below the 1.6x that tears the outboard leg. */
+      const latStride = Math.abs(sv.x * b.left.x + sv.z * b.left.z)
+                      + Math.abs(this.capHold.x * b.left.x + this.capHold.z * b.left.z);
       const maxSep = Math.min(
         Math.max(2 * this.halfStance + latStride,
                  4 * this.halfStance - this.k.minFootSep,
@@ -397,8 +501,6 @@ class GaitController extends Chassis {
     }
 
     // --- DCM tracking: p_cmd = p_ref + k (xi_meas - xi_ref), stable for k > 1 ---------
-    const w = this.plan.omega;
-    const xiMeas = V(st.com.x + st.comVel.x / w, 0, st.com.z + st.comVel.z / w);
     const cop = V(
       clamp(zmpRef.x + this.k.kDCM * (xiMeas.x - xiRef.x), zmpRef.x - this.k.copClamp, zmpRef.x + this.k.copClamp),
       0,

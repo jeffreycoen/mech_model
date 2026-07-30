@@ -14,8 +14,11 @@
    ring-down and the walk were indistinguishable. Fixed three ways: 20 Hz instead of 10, substep
    EXTREMES rather than snapshots in the joint record, and the burst buffer below for the cases
    where the waveform itself is the question. */
+/* BUILD_TAG in the session id so the FILENAME names the build (MK1.36.0). The hdr record
+   always carried it, but verifying a log meant opening it; `ls logs/` should be enough.
+   logserver's safeId keeps [A-Za-z0-9_.-], so the dots survive. */
 const SESSION='s'+new Date().toISOString().replace(/[^0-9]/g,'').slice(0,14)+'-'+
-  Math.floor(Math.random()*1e6).toString(36);
+  BUILD_TAG+'-'+Math.floor(Math.random()*1e6).toString(36);
 let logBuf=[], logOn=true, logFrame=0, lastFlush=0, logDropped=0;
 /* 60 000, was 20 000. The joint record roughly tripled in width and the state rate doubled, and
    the cap was already only ~2.7 s of headroom at the old rate -- a single slow POST over the

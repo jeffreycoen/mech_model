@@ -1,6 +1,9 @@
 /* ---------- loop ---------- */
 const target=new THREE.Vector3(0,3.1,0);
 let last=performance.now(), accum=0, fpsT=0, fpsN=0, fps=0;
+// Sim IMU + capturability light (MK1.36.0); written each display frame, read by the HUD
+// extras in 05-telemetry-sheet.js and logged in every `st` record.
+let accPrevV=null, accPrevT=0, accVec=[0,0,0], capState=0;
 const DT=1/60;
 /* Tab title from BUILD_TITLE, so the version in the tab, the HUD chip and the session-log
    header are one string from core/preamble.js and cannot drift apart. */
@@ -113,16 +116,27 @@ function tick(now){
   while(accum>=SIM_DT && n<3*simSteps){
     const before=world.breakEvents.length;
     stEst=groundTruthState(rig,world);
-    gait.update(stEst,SIM_DT);
-    /* stabiliserYaw(), not cmd.facing: at rest the feet are planted and the body cannot
-       turn, so a leftover heading error would have the gyro grinding yaw torque through
-       the soles of a machine that is meant to be standing still. */
-    /* Hand the gyro the SAME reference the ankles balance against -- the planner's ZMP
-       while a plan is running, null when there is none. Without it the gyro measures its
-       capture error from the support centre and brakes every step of a normal walk. */
-    if(cmg){ cmg.targetYaw=gait.stabiliserYaw();
-             cmg.copRef=gait.balance?gait.balance.copOverride:null;
-             cmg.update(stEst,SIM_DT); }
+    /* DOWN STATE (MK1.36.0). The walk controller used to keep running after a fall,
+       commanding step targets in a pose its plan never modeled -- every servo saturated
+       chasing them, which was both the on-screen flailing and the post-fall break
+       cascades (5 mounts at once in log s20260730011112). Down means LIMP: each joint's
+       target is pinned to its own current angle, so kp holds nothing and kd/kv damp
+       whatever motion is left. The gyro is not updated -- no attitude authority on a
+       machine that has no attitude to save. Recovery is the respawn button. */
+    if(!fallen){
+      gait.update(stEst,SIM_DT);
+      /* stabiliserYaw(), not cmd.facing: at rest the feet are planted and the body cannot
+         turn, so a leftover heading error would have the gyro grinding yaw torque through
+         the soles of a machine that is meant to be standing still. */
+      /* Hand the gyro the SAME reference the ankles balance against -- the planner's ZMP
+         while a plan is running, null when there is none. Without it the gyro measures its
+         capture error from the support centre and brakes every step of a normal walk. */
+      if(cmg){ cmg.targetYaw=gait.stabiliserYaw();
+               cmg.copRef=gait.balance?gait.balance.copOverride:null;
+               cmg.update(stEst,SIM_DT); }
+    } else {
+      for(const j of Object.values(rig.joints)) j.target=j.angle;
+    }
     world.step(SIM_DT);
     if(world.breakEvents.length>before) slowUntil=now+1500;
     accum-=SIM_DT; n++; simT+=SIM_DT;
@@ -185,6 +199,56 @@ function tick(now){
     r.root.classList.toggle('torn',!!j.broken);
     if(u>peak){ peak=u; peakName=n2; }
   }
+
+  /* ---- PELVIS ACCELEROMETER + CAPTURABILITY LIGHT (MK1.36.0) ----
+     accVec is the exact sim IMU: pelvis dv/dt across the display frame, m/s^2, world
+     axes. capState is 0 green / 1 yellow / 2 red: green while the capture point
+     xi = com + comVel/omega sits inside the box the ankles can reach (no step needed);
+     yellow while a single catch step could still land at it (sagittal strideCap,
+     lateral splay headroom); red beyond that or fallen -- no single step arrests it.
+     Both are HUD + log instrumentation; NO control law reads either. */
+  if(stEst){
+    const dtA=simT-accPrevT;
+    if(accPrevV&&dtA>1e-6){
+      accVec=[(rig.bodies.pelvis.v.x-accPrevV[0])/dtA,
+              (rig.bodies.pelvis.v.y-accPrevV[1])/dtA,
+              (rig.bodies.pelvis.v.z-accPrevV[2])/dtA];
+    }
+    accPrevV=[rig.bodies.pelvis.v.x,rig.bodies.pelvis.v.y,rig.bodies.pelvis.v.z];
+    accPrevT=simT;
+    capState=2;
+    if(!fallen){
+      if(!gait.plant||!gait.plant.L){
+        /* Quad (MK1.40.0): the capture point against the crawl's own support polygon.
+           The Heavy had been green-at-fall since the light existed because the biped
+           model didn't apply. Red = xi outside the polygon: a static walker has no catch
+           step, so that is genuinely unrecoverable, which is exactly what the light is
+           for. Yellow inside but under half the crawl margin. */
+        if(typeof gait.supportMargin==='function'&&stEst.com){
+          const zc=Math.max(1e-4,stEst.com.y), om=Math.sqrt((gait.k.gravity||9.81)/zc);
+          const mg=gait.supportMargin(stEst.com.x+stEst.comVel.x/om,
+                                      stEst.com.z+stEst.comVel.z/om);
+          const cm=gait.k.crawlMargin||0.01;
+          capState=mg>=0.5*cm?0:(mg>=0?1:2);
+        } else capState=0;
+      }
+      else{
+        const zc=Math.max(1e-4,stEst.com.y), om=Math.sqrt((gait.k.gravity||9.81)/zc);
+        const xiX=stEst.com.x+stEst.comVel.x/om, xiZ=stEst.com.z+stEst.comVel.z/om;
+        const midX=(gait.plant.L.x+gait.plant.R.x)/2, midZ=(gait.plant.L.z+gait.plant.R.z)/2;
+        const bs=gait.basis();
+        const eF=Math.abs((xiX-midX)*bs.fwd.x+(xiZ-midZ)*bs.fwd.z);
+        const eL=Math.abs((xiX-midX)*bs.left.x+(xiZ-midZ)*bs.left.z);
+        const bk=gait.balance.k, hs=gait.halfStance;
+        const latReach=((gait.k.splayMax||1.3)-1)*2*hs;
+        if(eF<=bk.copLimitX && eL<=bk.copLimitZ+hs) capState=0;
+        else if(eF<=bk.copLimitX+(gait.k.strideCap||0) && eL<=bk.copLimitZ+hs+latReach) capState=1;
+        else capState=2;
+      }
+    }
+  }
+  renderHudExtras();
+  driveCardTick();
 
   document.getElementById('peak').textContent='peak '+(peak*100).toFixed(0)+'% '+peakName;
   document.getElementById('c-rate').textContent=fps.toFixed(0)+' fps · '+simMs.toFixed(1)+' ms';
@@ -340,6 +404,9 @@ function tick(now){
          failures -- a rising q with rt>0 is the transport losing ground, which is what silently
          truncated a whole session before flushLog retried. */
       q:logBuf.length, rt:logFails,
+      // Sim IMU (pelvis dv/dt, m/s^2, world axes) and the capturability light
+      // (0 green / 1 yellow / 2 red) -- see the HUD block for both definitions.
+      acc:accVec.map(v=>+v.toFixed(3)),cap:capState,
       fall:fallen?1:0,brk:world.breakEvents.length,fps:+fps.toFixed(1),ms:+simMs.toFixed(2),j:jt});
   }
   if(fallen&&!fallLogged){ fallLogged=true;

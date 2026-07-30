@@ -20,12 +20,25 @@
   #stage{position:fixed;inset:0}
   canvas{display:block;touch-action:none}
 
-  #strip{position:fixed;left:10px;top:10px;z-index:6;display:flex;flex-wrap:wrap;gap:4px;
-    max-width:calc(100vw - 20px);pointer-events:none}
+  /* TWO FIXED ROWS (MK1.39.0). One flex-wrap container held every chip, permanent and
+     transient alike, so a chip toggling display reflowed the wrap: the strip jumped
+     between 2 and 3 lines and every chip changed position while driving. Row 1 is the
+     chips that are ALWAYS there, in fixed order, so nothing in it ever moves; row 2 is
+     the transients (card prompt, torn, fall, gyro, envelope) with its height RESERVED
+     even when empty, so appearing and disappearing messages change pixels, not layout. */
+  #strip{position:fixed;left:10px;top:10px;z-index:6;pointer-events:none;
+    max-width:calc(100vw - 20px)}
+  .striprow{display:flex;flex-wrap:nowrap;gap:4px;margin-bottom:4px;overflow:hidden;
+    min-height:24px}
   .chip{font-family:var(--mono);font-size:9.5px;letter-spacing:.09em;padding:4px 7px;
     border:1px solid var(--ink);background:rgba(232,228,218,.9);white-space:nowrap}
   .chip b{font-weight:600}
   .chip.warn{border-color:var(--high);color:var(--high)}
+  .chip.notice{border-color:var(--mid);color:var(--mid)}
+  /* Capturability light: colored dot inline before the chip's own word, so the chip keeps
+     using the same .chip/.chip.warn rules everything else in #strip already uses. */
+  .capdot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;
+    vertical-align:middle;background:var(--low)}
 
   #presetBar{position:fixed;right:10px;top:10px;z-index:7;width:min(300px,calc(100vw - 20px));
     border:1px solid var(--ink);background:rgba(232,228,218,.95)}
@@ -69,6 +82,19 @@
     padding:0 11px;cursor:pointer;font-family:var(--mono);font-size:9px;letter-spacing:.14em;
     text-transform:uppercase;border-bottom:1px solid transparent}
   #tel.open #telHd{border-bottom-color:var(--ink)}
+  /* Pelvis-accelerometer strip chart. Lives at the top of the telemetry sheet -- opens/closes
+     with it on mobile (so it never sits over the sticks), always visible in the right-hand
+     panel on desktop. */
+  #accWrap{flex:0 0 auto;margin:6px 11px 2px;font-family:var(--mono);font-size:8.5px}
+  #accLegend{display:flex;align-items:center;gap:8px;color:#6B6659;margin-bottom:3px}
+  #accLegend .ax{padding-left:11px;position:relative}
+  #accLegend .ax::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%);
+    width:8px;height:2px}
+  #accLegend .ax.x::before{background:var(--high)}
+  #accLegend .ax.y::before{background:var(--low)}
+  #accLegend .ax.z::before{background:var(--slate)}
+  #accRange{margin-left:auto;color:#4A463C}
+  #accCanvas{display:block;width:180px;height:60px;border:1px solid var(--rule);background:var(--paper)}
   #ramp{flex:0 0 auto;height:5px;margin:6px 11px;
     background:linear-gradient(90deg,var(--low),var(--mid),var(--high))}
   #rows{overflow-y:auto;padding:3px 0 calc(8px + var(--pad-b));-webkit-overflow-scrolling:touch}
@@ -129,16 +155,23 @@
 <div id="stage"></div>
 
 <div id="strip">
-  <div class="chip" id="c-mass">— · <b>—</b></div>
-  <div class="chip" id="c-rate">— fps</div>
-  <div class="chip" id="c-speed">0.00 m/s</div>
-  <div class="chip" id="c-steps">0 steps</div>
-  <div class="chip" id="c-state">standing</div>
-  <div class="chip" id="c-torn" style="display:none"></div>
-  <button class="chip warn" id="c-fall" style="display:none;pointer-events:auto"></button>
-  <div class="chip" id="c-steer" style="display:none">TURNING WHILE MOVING</div>
-  <div class="chip warn" id="c-env" style="display:none">BEYOND VERIFIED ENVELOPE</div>
-  <div class="chip" id="c-cmg" style="display:none">gyro —</div>
+  <div class="striprow">
+    <div class="chip" id="c-mass">— · <b>—</b></div>
+    <div class="chip" id="c-rate">— fps</div>
+    <div class="chip" id="c-speed">0.00 m/s</div>
+    <div class="chip" id="c-steps">0 steps</div>
+    <div class="chip" id="c-state">standing</div>
+    <div class="chip" id="c-cap"><i class="capdot" id="c-cap-dot"></i><span id="c-cap-label">balanced</span></div>
+    <button class="chip" id="c-card" style="pointer-events:auto">CARD</button>
+  </div>
+  <div class="striprow">
+    <div class="chip" id="c-card-seg" style="display:none">—</div>
+    <button class="chip warn" id="c-fall" style="display:none;pointer-events:auto"></button>
+    <div class="chip" id="c-torn" style="display:none"></div>
+    <div class="chip" id="c-cmg" style="display:none">gyro —</div>
+    <div class="chip" id="c-steer" style="display:none">TURNING WHILE MOVING</div>
+    <div class="chip warn" id="c-env" style="display:none">BEYOND VERIFIED ENVELOPE</div>
+  </div>
 </div>
 
 <div id="presetBar">
@@ -212,6 +245,10 @@
 <div id="tel">
   <div id="telHd" role="button" tabindex="0" aria-expanded="false">
     <span>Mount utilisation</span><span id="peak">peak —</span>
+  </div>
+  <div id="accWrap">
+    <div id="accLegend"><span class="ax x">X</span><span class="ax y">Y</span><span class="ax z">Z</span><span id="accRange">&plusmn;0.0 m/s&sup2;</span></div>
+    <canvas id="accCanvas"></canvas>
   </div>
   <div id="ramp"></div>
   <div id="rows"></div>

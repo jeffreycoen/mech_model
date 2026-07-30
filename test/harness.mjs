@@ -13,7 +13,8 @@
 import {readFileSync,writeFileSync,mkdirSync} from 'node:fs';
 const EXPORTS='World, assembleMech, groundRig, rigStats, GaitController, CrawlController, '
   +'groundTruthState, setGravity, V, qrot, PRESETS, applyPreset, scaleRig, deriveGait, '
-  +'fitCMG, ATST_SPEC, ATAT_SPEC, buildRig, DISPLAY_H, BUILD, BUILD_TAG';
+  +'fitCMG, ATST_SPEC, ATAT_SPEC, buildRig, DISPLAY_H, BUILD, BUILD_TAG, swingLift, '
+  +'deriveArmTMD, deriveGimbalTMD';
 /* One output path, where there used to be three (sim/inv/suite.gen.mjs). Every suite now
    generates byte-identical content from the same manifest and the same list, so two running
    at once write the same bytes -- but writeFileSync is not atomic, so do not run two suites

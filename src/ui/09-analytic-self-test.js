@@ -26,6 +26,7 @@ function freshRig(o){
   const g=new GaitController(r,{copClamp:0.45,tSS:0.90,gravity:gv,
     travelRate:dg.travelRate,turnRate:dg.turnRate,yawPerStep:dg.yawPerStep,
     waistLimit:dg.waistLimit,waistRate:dg.waistRate,pelvisRate:dg.pelvisRate,
+    strideCap:dg.strideCap,
     balance:{kCop:0.40,copLimitX:dg.copLimitX,copLimitZ:dg.copLimitZ}});
   return {w,r,g};
 }
@@ -226,7 +227,7 @@ const GATES=[
     const g=new GaitController(rig,{gravity:9.81,tSS:dg.tSS,tDS:dg.tDS,stepHeight:dg.stepHeight,
       pelvisDrop:dg.pelvisDrop,minFootSep:dg.minFootSep,copClamp:dg.copClamp,
       settleTime:dg.settleTime,crouchTime:dg.crouchTime,tStart:dg.tStart,tEnd:dg.tEnd,
-      travelRate:dg.travelRate,turnRate:dg.turnRate,
+      travelRate:dg.travelRate,turnRate:dg.turnRate,strideCap:dg.strideCap,
       balance:{kCop:0.60,copLimitX:dg.copLimitX,copLimitZ:dg.copLimitZ}});
     const L=dg.L, tRef=Math.sqrt(L/9.81), x0=rig.bodies.pelvis.x.x;
     let t=0; const n=Math.round(nTref*tRef/dt);

@@ -47,6 +47,27 @@ const ATST_SPEC = {
     head:   { mass: 27.5, dim: [0.65, 0.375, 0.85], parent: 'torso', type: 'weld',
               jp: [0.775, -0.35, 0], jc: [-0.325, 0, 0],
               lim: { tension: 780e3, shear: 660e3, bend: 330e3, torsion: 210e3 } },
+    /* GIMBAL TUNED MASS DAMPER (MK1.38.0). A 130 kg bob -- 3% of the machine -- on a
+       two-axis gimbal INSIDE the hull volume, so canon is untouched: pivot on the pelvis
+       top, bob CoM 0.55 m ABOVE it, hidden within the cockpit box. Above, not hanging:
+       a hanging pendulum tuned to the machine's own sway frequency needs a cable as long
+       as the machine's COM is high (l = g/w^2), which does not fit; an INVERTED bob's
+       gravity destabilises, so a centering spring can place the natural frequency
+       anywhere, including exactly on the Den Hartog target -- both axes, no gravity
+       floor, unlike the Light Frame's arms. Springs and dampers (kp/kd on these two
+       hinges) are DERIVED, not typed: deriveGimbalTMD() in rig/derive.js, applied by
+       buildRig, checked by invariant I15 against an independent re-implementation.
+       Mount limits are generous on purpose -- an internal absorber must never be the
+       fuse. Ranges +-25 deg: past that the end stops take over, which only happens
+       during a fall the absorber has already lost. */
+    tmdRing: { mass: 12, dim: [0.32, 0.16, 0.32], parent: 'pelvis', type: 'hinge',
+               axis: [1, 0, 0], angle0: 0, tauMax: 3e3, kpTau: 3e3, range: [-25 * D, 25 * D],
+               jp: [0, 0.35, 0], jc: [0, 0, 0],
+               lim: { tension: 2000e3, shear: 2000e3, bend: 1000e3, torsion: 1000e3 } },
+    tmdBob:  { mass: 130, dim: [0.55, 0.55, 0.55], parent: 'tmdRing', type: 'hinge',
+               axis: [0, 0, 1], angle0: 0, tauMax: 3e3, kpTau: 3e3, range: [-25 * D, 25 * D],
+               jp: [0, 0, 0], jc: [0, -0.55, 0],
+               lim: { tension: 2000e3, shear: 2000e3, bend: 1000e3, torsion: 1000e3 } },
   },
   limbs: [{ side: 'L', s: +1 }, { side: 'R', s: -1 }],
   chain: (s, side) => {
@@ -87,7 +108,7 @@ const ATST_SPEC = {
       { name: `ankleYoke${side}`, parent: `shin${side}`, mass: 90, dim: [0.70, 0.50, 0.70],
         type: 'hinge', axis: [0, 0, 1], angle0: -9 * D2, jp: [0, -1.30, 0], jc: [0, 0, 0],
         tauMax: 107e3, kpTau: 80e3, range: [-40 * D2, 30 * D2],
-        lim: { tension: 1890e3, shear: 1515e3, bend: 810e3, torsion: 400e3 } },
+        lim: { tension: 2835e3, shear: 2273e3, bend: 1215e3, torsion: 600e3 } },
       /* FOOT WIDTH. 1.30 -> 1.70 m. A canon AT-ST foot is 0.153 of the machine's own
          height where MK1's is 0.224, and that ratio -- not the silhouette, not the mass --
          is what the lateral CoP limit is computed from. 1.70 puts the Scout at 0.201 of
@@ -98,7 +119,7 @@ const ATST_SPEC = {
       { name: `foot${side}`, parent: `ankleYoke${side}`, mass: 360, dim: [2.00, 0.38, 1.70],
         type: 'hinge', axis: [1, 0, 0], angle0: 0, jp: [0, 0, 0], jc: [-0.15, 0.175, 0],
         tauMax: 104e3, kpTau: 55e3, range: [-25 * D2, 25 * D2],
-        lim: { tension: 1890e3, shear: 1515e3, bend: 810e3, torsion: 408e3 } },
+        lim: { tension: 2835e3, shear: 2273e3, bend: 1215e3, torsion: 612e3 } },
     ];
   },
 };

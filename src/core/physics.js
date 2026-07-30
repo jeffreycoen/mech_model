@@ -278,6 +278,7 @@ class Hinge {
     // ~3 deg of error and roughly critical damping for a limb-scale inertia.
     this.kp = o.kp ?? this.tauMax / (3 * Math.PI / 180);
     this.kd = o.kd ?? this.kp * 0.06;
+    this.kv = o.kv ?? 0;                         // N.m/(rad/s)^2, velocity-squared damper
     this.target = o.target ?? 0;                 // rad
     this.limits = o.limits || null;              // [lo,hi] rad
     // End-stop compliance, rad per N.m. 1e-7 gives ~0.23 deg of deflection at 40 kN.m,
@@ -349,7 +350,7 @@ class Hinge {
       const wRel = vdot(vsub(b.w, a.w), axis);
       // Feedforward rides ON TOP of the servo. A balance loop that replaces the PD term
       // throws away the passive stiffness holding the posture up.
-      const tauPD = this.kp * e - this.kd * wRel + this.tauFF;
+      const tauPD = this.kp * e - this.kd * wRel - this.kv * wRel * Math.abs(wRel) + this.tauFF;
       this.wRel = wRel; this.tauDemand = tauPD;      // telemetry only; see the ctor
       /* Governor, before the ceiling. tauHeld is what was actually delivered last substep and is
          updated once per substep in measure(), so the cap is the same for all 8 iterations --
@@ -421,7 +422,8 @@ class GroundContacts {
   constructor(o = {}) {
     this.lscale = o.lscale ?? 1;
     this.mu = o.mu ?? 0.9;
-    this.compliance = o.compliance ?? 0;
+    this.compliance = o.compliance ?? 0;   // m/N of crush under load; 0 = rigid ground
+    this.damp = o.damp ?? 0;               // dimensionless XPBD damping weight, 0 = undamped
     this.active = [];
   }
   /* Collected once per SUBSTEP with a speculative margin that scales with how far the
@@ -456,7 +458,17 @@ class GroundContacts {
       // away and leaves only the last iteration's residual push-out, which measured
       // 53 kN against an 80 kN rig while standing still. Relax toward zero instead, and
       // clamp the TOTAL at zero so the contact stays unilateral (it can push, not pull).
-      let dl = (depth - a * c.lambda) / (w + a);
+      /* CRUSHED GROUND (MK1.35.0). With compliance set, the ground yields under load
+         instead of stopping a landing corner inside one substep -- the substep contact
+         telemetry read 1.5 W p95 / 3.2 W peak on landings against a rigid plane, and the
+         stop rang straight up the rigid leg into the hull. The damping term is the XPBD
+         paper's: resist normal MOTION since the substep start, scaled by the dimensionless
+         weight `damp`. Approach (dy < 0) pushes harder, separation pushes less, so it
+         dissipates on the way in and never adds bounce on the way out. With
+         compliance = 0 and damp = 0 this reduces exactly to the rigid form. */
+      const g = this.damp;
+      const dy = wp.y - (b.xp.y + qrot(b.qp, c.lp).y);
+      let dl = (depth - a * c.lambda - g * dy) / ((1 + g) * w + a);
       if (c.lambda + dl < 0) dl = -c.lambda;
       if (dl !== 0) {
         c.lambda += dl;

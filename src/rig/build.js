@@ -70,6 +70,20 @@ function buildRig(key, opts = {}) {
   groundRig(rig);
   const dg = deriveGait(rig);
 
+  /* CRUSHED GROUND, derived HERE because it needs the FINAL masses and lengths -- after
+     applyPreset (mass knobs) and scaleRig. One bodyweight of load crushes the ground by
+     1% of leg length; landings that spiked to 3.2 W against the rigid plane sink ~3% of
+     a leg and give the impulse somewhere to go. damp = 1 is the XPBD damping weight: the
+     crush dissipates on approach and does not spring back with restitution, which is the
+     gas-accumulator behaviour, not a trampoline. Froude-clean by construction:
+     depth/force goes as s/s^3 = s^-2, exactly how a hand-scaled compliance would move. */
+  {
+    let mass = 0; for (const b of Object.values(rig.bodies)) mass += b.mass;
+    world.contacts.compliance = (0.01 * (rig.leg.thigh + rig.leg.shin)) / (mass * gv);
+    world.contacts.damp = 1.0;
+  }
+
+
   /* ACTUATOR GOVERNOR -- OFF, and it must stay off in this form. Shipped MK1.18.0 at
      tauRateFrac = 3/(tSS+tDS), i.e. full torque in 81 ms, and all three rigs blew apart on spawn.
 
@@ -105,8 +119,49 @@ function buildRig(key, opts = {}) {
     // desat is a controller TIME and goes as sqrt(scale) like every other one.
     desat: (P.cmg.desat ?? 7.0) * rs, enabled: opts.cmgOn !== false,
     // Gyro slew is scaled off the gait, so it comes from deriveGait and is not re-derived.
-    stepPeriod: dg.tSS + dg.tDS,
+    stepPeriod: dg.stepPeriod,
   })) : null;
+
+  /* ARM TUNED MASS DAMPERS (MK1.37.0), presets with armTMD only. Applied AFTER fitCMG --
+     the flywheel is real machine mass and the plan's mass ratio must see it; applied
+     before it, the plan disagreed with the invariant's re-derivation by 0.4% and I14
+     caught exactly that. deriveArmTMD() in rig/derive.js is the one site; I14 checks the
+     applied joints against the same function. This OVERWRITES kp/kd on the four arm
+     joints deliberately -- the old stiff servo tuning is what rang. kv comes from the
+     same per-joint stability cap applyPreset uses (I9 form), at half the room. */
+  if (P.armTMD) {
+    const tmd = deriveArmTMD(rig, gv);
+    if (tmd) for (const n of ['upperArmL', 'foreArmL', 'upperArmR', 'foreArmR']) {
+      const j = rig.joints[n];
+      j.kp = tmd[n].kp; j.kd = tmd[n].kd;
+      const h = SIM_DT / (opts.subs ?? 10);
+      const Ia = inertiaAbout(j.b, j.axisA);
+      const room = Math.max(0, 0.9 * (2 * Ia / h - j.kd) / 2);
+      j.kv = 0.5 * room * room / j.tauMax;
+    }
+  }
+
+  /* GIMBAL TMD (MK1.38.0), presets with gimbalTMD only. Same shape as armTMD above:
+     applied after fitCMG so the plan's mass ratio sees the flywheel, derived at ONE site
+     (deriveGimbalTMD), checked by I15 against an independent implementation. kv at half
+     the I9 cap, same as the arms. */
+  if (P.gimbalTMD) {
+    const tmd = deriveGimbalTMD(rig, gv);
+    if (tmd) for (const n of ['tmdRing', 'tmdBob']) {
+      const j = rig.joints[n];
+      j.kp = tmd[n].kp; j.kd = tmd[n].kd;
+      const h = SIM_DT / (opts.subs ?? 10);
+      const Ia = inertiaAbout(j.b, j.axisA);
+      const room = Math.max(0, 0.9 * (2 * Ia / h - j.kd) / 2);
+      j.kv = 0.5 * room * room / j.tauMax;
+    }
+  }
+
+  /* Stride cap, ONE site. This was resolved here for the command path and passed to the
+     controller as bare dg.strideCap eight lines apart -- a preset declaring strideCap
+     would have changed what the sticks may command while the controller's catch bound
+     kept the derived value (review finding, MK1.33.0). Resolve once, use twice. */
+  const strideCap = P.strideCap !== undefined ? P.strideCap : dg.strideCap;
 
   const Ctl = CONTROLLERS[rig.gait] || GaitController;
   /* Every derived quantity is passed. yawPerStep was once NOT, so the artifact fell back to
@@ -116,19 +171,22 @@ function buildRig(key, opts = {}) {
     gravity: gv, tSS: dg.tSS, tDS: dg.tDS, stepHeight: dg.stepHeight,
     // Crawl timings are the SAME derived quantities under crawl names; the biped ignores
     // the crawl keys and vice versa, which keeps the scale law in one place.
-    tSwing: dg.tSS, tShift: dg.tDS, crawlMargin: dg.crawlMargin,
+    tSwing: dg.tSwing, tShift: dg.tShift, crawlMargin: dg.crawlMargin,
     settleTime: dg.settleTime, crouchTime: dg.crouchTime, tStart: dg.tStart, tEnd: dg.tEnd,
     pelvisDrop: dg.pelvisDrop, minFootSep: dg.minFootSep, copClamp: dg.copClamp,
     travelRate: dg.travelRate, turnRate: dg.turnRate, yawPerStep: dg.yawPerStep,
     waistLimit: dg.waistLimit, waistRate: dg.waistRate, pelvisRate: dg.pelvisRate,
+    // Bounds the capture-point catch step in gait.js; the SAME resolved cap the command
+    // path uses (see above), so a catch can never out-reach what a commanded stride may.
+    strideCap,
     balance: Object.assign({ kCop: P.kCop !== undefined ? P.kCop : 0.40,
       copLimitX: dg.copLimitX, copLimitZ: dg.copLimitZ }, P.balance || {}),
   }, P.gait || {}));
 
   /* Stride cap must be the one derived for THIS rig at THIS size. It once fell back to an
      absolute 0.62 m from when the rig was full size -- 12x the working stride at 1 ft, and
-     the driving logs show foot mounts tearing a few seconds in at every size. */
-  const strideCap = P.strideCap !== undefined ? P.strideCap : dg.strideCap;
+     the driving logs show foot mounts tearing a few seconds in at every size.
+     Resolved ONCE above the controller construction, which shares it. */
   return { world, rig, gait, cmg, dg, SC, SIM_DT, simSteps, preset: P, gravity: gv,
            strideCap, envCap: P.envCap !== undefined ? P.envCap : strideCap * 1.5 };
 }
