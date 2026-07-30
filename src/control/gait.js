@@ -51,7 +51,11 @@ class GaitController extends Chassis {
          highest-risk item on the list when it shipped and it is the one that failed.
          1.30 keeps roughly two thirds of the strafe the widening bought while pulling the
          ceiling well clear of the 1.6x the code records as tearing the outboard leg. */
-      splayMax: 1.30,
+      /* 1.30 -> 1.40 (MK1.43.0). The Scout now completes every card segment EXCEPT
+         strafe -- the lateral axis, where I10 records one catch step delivering ~38% of
+         the trigger distance. 1.40 buys lateral catch room while staying under the 1.6x
+         that tore the outboard leg. */
+      splayMax: 1.40,
       /* Fore-aft offset, as a fraction of nominal stance, above which a release takes a
          squaring step instead of resting. 0.15 of a 1.20 m stance is 0.18 m native; the
          two bad releases measured 141 and 147 mm at a 73 mm stance, which is 2x. */
@@ -106,10 +110,11 @@ class GaitController extends Chassis {
        planning against a pendulum 5.6x too tall, putting omega out by a factor of 2.4.
        It bound even on the 4 ft default (0.75 m clamped to 1.0). */
     const zc = Math.max(1e-4, st.com.y);
+    const rk = this.rampK || 1;
     this.plan = new DCMPlan(buildPhases({
       left: this.plant.L, right: this.plant.R,
       stride: this.strideVec(), nSteps: this.k.horizon,
-      tDS: this.k.tDS, tSS: this.k.tSS, tStart: this.k.tStart, tEnd: this.k.tEnd,
+      tDS: this.k.tDS * rk, tSS: this.k.tSS * rk, tStart: this.k.tStart, tEnd: this.k.tEnd,
     }), zc, this.k.gravity);
     this.tracker = new COMTracker(this.plan, st.com);
     this.tPlan = 0;
@@ -138,6 +143,20 @@ class GaitController extends Chassis {
     this.cmd.tx = 0; this.cmd.tz = 0;
     this.want.tx = 0; this.want.tz = 0;
     this.latch();
+    /* FEEDFORWARD STOP (MK1.43.0). Decide ONCE, at release, where the CoM is going --
+       the capture point -- and land the closing step there. The live capture feedback
+       stays out of stopping swings (see the swing block): predict, step, done, instead
+       of chasing the error all the way down. Cap at strideCap like every catch. */
+    {
+      const zc = Math.max(1e-4, st.com.y);
+      const xi = this.xiMeasured(st, Math.sqrt(this.k.gravity / zc));
+      const mx = (this.plant.L.x + this.plant.R.x) / 2,
+            mz = (this.plant.L.z + this.plant.R.z) / 2;
+      let ax = this.k.kCapture * (xi.x - mx), az = this.k.kCapture * (xi.z - mz);
+      const m = Math.hypot(ax, az);
+      if (m > this.k.strideCap) { ax *= this.k.strideCap / m; az *= this.k.strideCap / m; }
+      this.closeAim = { x: ax, z: az };
+    }
     // A directed side means a CATCH step -- the caller knows which foot can reach the
     // capture point. Undirected closes keep the alternation.
     this.nextSwing = side || (this.nextSwing === 'L' ? 'R' : 'L');
@@ -174,7 +193,7 @@ class GaitController extends Chassis {
     this.plan = new DCMPlan(buildPhases({
       left: this.plant.L, right: this.plant.R,
       stride: this.strideVec(), nSteps: this.stepsRemaining,
-      tDS: this.k.tDS, tSS: this.k.tSS,
+      tDS: this.k.tDS * (this.rampK || 1), tSS: this.k.tSS * (this.rampK || 1),
       // Replanning happens AT touchdown, which is already the start of double support,
       // so a full leading DS phase there is dead time -- it cost 2*tDS + tSS per step
       // instead of tDS + tSS. Starting from a STANDSTILL is the exception: the COM is
@@ -184,6 +203,8 @@ class GaitController extends Chassis {
     }), zc, this.k.gravity);
     this.tracker = new COMTracker(this.plan, st.com);
     this.tPlan = 0;
+    // Cadence-ramp decay: 60% of the excess sheds per rebuild, floor at full cadence.
+    if (this.rampK) { this.rampK = 1 + (this.rampK - 1) * 0.6; if (this.rampK < 1.02) this.rampK = 0; }
   }
 
   update(st, dt) {
@@ -248,7 +269,14 @@ class GaitController extends Chassis {
     if (this.stopping && this.speedCmd() > this.moveEps()
         && !String(this.state).startsWith('SS')) this.stopping = false;
     if (this.standing) {
-      if (wantMove) { this.standing = false; this._fromStand = true; this.rebuild(st); this._fromStand = false; }
+      if (wantMove) {
+        /* CADENCE RAMP (MK1.43.0): the first step out of a stand used to fire at full
+           cadence. Crane rule -- ramp in: the first plan's phases run 1.35x long and the
+           factor decays toward 1 with each rebuild (0.6 of the excess per step, ~3 steps
+           to full cadence). Stopping already ramps out via the plan's tEnd runout. */
+        this.rampK = 1.35;
+        this.standing = false; this._fromStand = true; this.rebuild(st); this._fromStand = false;
+      }
       else {
         /* NEUTRAL STANCE, part 1: do not rest in a lunge.
            The closing step only ever fired at a touchdown, so releasing the stick outside
@@ -365,6 +393,7 @@ class GaitController extends Chassis {
       }
       this.stepsTaken++;
       this.capHold = null;   // next swing samples the DCM error fresh
+      this.closeAim = null;  // a feedforward stop aim is one step long, by definition
       this.latch();
       /* Stopping is a manoeuvre, not the absence of one.
          Releasing the stick used to just ramp travel to zero, which leaves the swing foot
@@ -441,7 +470,10 @@ class GaitController extends Chassis {
          Placed AFTER the closing-step override so a stop is caught too, and BEFORE the
          pinch/splay clamps so a catch step can never cross the stance foot or tear the
          splay. Bounded by the rig's own stride cap. */
-      if (s < this.k.capCommit || !this.capHold) {
+      if (this.stopping && this.closeAim) {
+        // Feedforward stop: the aim was fixed at release; no live chase.
+        this.capHold = { x: this.closeAim.x, z: this.closeAim.z };
+      } else if (s < this.k.capCommit || !this.capHold) {
         let capX = this.k.kCapture * (xiMeas.x - xiRef.x),
             capZ = this.k.kCapture * (xiMeas.z - xiRef.z);
         const m = Math.hypot(capX, capZ), db = this.k.capDeadband * this.k.strideCap;
@@ -496,10 +528,23 @@ class GaitController extends Chassis {
     }
 
     // --- DCM tracking: p_cmd = p_ref + k (xi_meas - xi_ref), stable for k > 1 ---------
+    /* EVENT-TRIGGERED, not per-tick (MK1.43.0): the correction term is HELD until the
+       measured error moves more than 0.25*copClamp from where it was last decided, then
+       re-decided at once. Continuous per-tick correction is chatter into the ankles at
+       every sensor wiggle; a big error re-decides IMMEDIATELY, so nothing is ever gated
+       -- this is the magnitude-triggered form of the intermittence idea, not the
+       time-gated form MK1.40.0 tried and MK1.42.0 removed for gating real falls. The
+       zmpRef feedforward still moves smoothly every tick; only the error term is held. */
+    {
+      const ex = xiMeas.x - xiRef.x, ez = xiMeas.z - xiRef.z;
+      if (!this.copHold
+          || Math.hypot(ex - this.copHold.ex, ez - this.copHold.ez) > 0.25 * this.k.copClamp)
+        this.copHold = { ex, ez };
+    }
     const cop = V(
-      clamp(zmpRef.x + this.k.kDCM * (xiMeas.x - xiRef.x), zmpRef.x - this.k.copClamp, zmpRef.x + this.k.copClamp),
+      clamp(zmpRef.x + this.k.kDCM * this.copHold.ex, zmpRef.x - this.k.copClamp, zmpRef.x + this.k.copClamp),
       0,
-      clamp(zmpRef.z + this.k.kDCM * (xiMeas.z - xiRef.z), zmpRef.z - this.k.copClamp, zmpRef.z + this.k.copClamp));
+      clamp(zmpRef.z + this.k.kDCM * this.copHold.ez, zmpRef.z - this.k.copClamp, zmpRef.z + this.k.copClamp));
     this.balance.copOverride = cop;
     this.balance.update(st, dt);
 

@@ -3,7 +3,7 @@ const target=new THREE.Vector3(0,3.1,0);
 let last=performance.now(), accum=0, fpsT=0, fpsN=0, fps=0;
 // Sim IMU + capturability light (MK1.36.0); written each display frame, read by the HUD
 // extras in 05-telemetry-sheet.js and logged in every `st` record.
-let accPrevV=null, accPrevT=0, accVec=[0,0,0], capState=0;
+let accPrevV=null, accPrevT=0, accVec=[0,0,0], capState=0, downDamped=false;
 const DT=1/60;
 /* Tab title from BUILD_TITLE, so the version in the tab, the HUD chip and the session-log
    header are one string from core/preamble.js and cannot drift apart. */
@@ -124,6 +124,7 @@ function tick(now){
        whatever motion is left. The gyro is not updated -- no attitude authority on a
        machine that has no attitude to save. Recovery is the respawn button. */
     if(!fallen){
+      downDamped=false;
       gait.update(stEst,SIM_DT);
       /* stabiliserYaw(), not cmd.facing: at rest the feet are planted and the body cannot
          turn, so a leftover heading error would have the gyro grinding yaw torque through
@@ -135,6 +136,17 @@ function tick(now){
                cmg.copRef=gait.balance?gait.balance.copOverride:null;
                cmg.update(stEst,SIM_DT); }
     } else {
+      /* DOWN arm damping (MK1.43.0). The TMD arms carry kp=0 and TMD-light kd, so the
+         ragdoll flailed them into the mounts -- 7 post-fall breaks in one MK1.40 session.
+         Once down, raise kd on every kp-free joint toward the I8 stability cap (once;
+         respawn rebuilds the rig fresh). Stiffness still costs nothing here. */
+      if(!downDamped){ downDamped=true;
+        const h=SIM_DT/10;
+        for(const j of Object.values(rig.joints)) if(j.kp===0&&j.b){
+          const Ia=inertiaAbout(j.b,j.axisA);
+          j.kd=Math.min(j.kd*8, 0.9*Ia/h);
+        }
+      }
       for(const j of Object.values(rig.joints)) j.target=j.angle;
     }
     world.step(SIM_DT);

@@ -87,16 +87,23 @@ function renderHudExtras(){
    Scripted prompt sequence for a driving session. This only prompts and stamps the log --
    it never touches gait.want/stick state; the human follows the prompts. Timed off simT
    deltas so pausing the sim pauses the card exactly like everything else in this file. */
+/* REQUIREMENT-GATED (MK1.43.0). The first card was a countdown: it showed a prompt,
+   ticked, and advanced whether or not the driver did the thing -- so a "completed card"
+   certified nothing. Each segment now has a req() over the LIVE sticks and only
+   accumulates time while it holds: the countdown stops the moment you stop complying,
+   and a segment cannot complete without its requirement actually met for its full
+   duration. Falls pause compliance (sticks drop), accumulated time survives respawn. */
+const idle=()=>Math.hypot(stickL.x,stickL.y)<0.15&&Math.hypot(stickR.x,stickR.y)<0.15;
 const CARD_SEGS=[
-  {name:'stand',    prompt:'hands off — stand still',       dur:10},
-  {name:'fwd',      prompt:'left stick full forward',       dur:5},
-  {name:'release1', prompt:'release stick, hands off',      dur:4},
-  {name:'back',     prompt:'left stick full back',          dur:3},
-  {name:'release2', prompt:'release stick, hands off',      dur:4},
-  {name:'turn',     prompt:'right stick — full turn, hold', dur:12},
-  {name:'walkturn', prompt:'walk forward while turning',    dur:8},
-  {name:'strafe',   prompt:'left stick full sideways',      dur:5},
-  {name:'done',     prompt:'card complete',                 dur:0},
+  {name:'stand',    prompt:'hands off — stand still',       dur:10, req:idle},
+  {name:'fwd',      prompt:'left stick full forward',       dur:5,  req:()=>stickL.y<-0.5},
+  {name:'release1', prompt:'release stick, hands off',      dur:4,  req:idle},
+  {name:'back',     prompt:'left stick full back',          dur:3,  req:()=>stickL.y>0.5},
+  {name:'release2', prompt:'release stick, hands off',      dur:4,  req:idle},
+  {name:'turn',     prompt:'right stick — full turn, hold', dur:12, req:()=>Math.abs(stickR.x)>0.5},
+  {name:'walkturn', prompt:'walk forward while turning',    dur:8,  req:()=>stickL.y<-0.4&&Math.abs(stickR.x)>0.4},
+  {name:'strafe',   prompt:'left stick full sideways',      dur:5,  req:()=>Math.abs(stickL.x)>0.5&&Math.abs(stickL.y)<0.4},
+  {name:'done',     prompt:'card complete',                 dur:0,  req:()=>false},
 ];
 const CARD_DONE_GRACE=2;          // seconds of simT the "card complete" chip lingers
 const cardBtn=document.getElementById('c-card'), cardSegEl=document.getElementById('c-card-seg');
@@ -118,6 +125,8 @@ function cardCancel(){
   cardActive=false; cardIdx=-1;
 }
 function cardAdvance(){
+  // completion stamp carries the compliance time actually banked
+  logEvent('card',{seg:CARD_SEGS[cardIdx].name,i:cardIdx,done:1,held:+cardElapsed.toFixed(1)});
   cardIdx++; cardElapsed=0;
   cardBegin(CARD_SEGS[cardIdx]);
 }
@@ -126,8 +135,9 @@ cardBtn.addEventListener('click',function(){ if(cardActive) cardCancel(); else c
 function driveCardTick(){
   if(cardActive){
     const dt=simT-cardLastSimT; cardLastSimT=simT;
-    cardElapsed+=dt;
     const seg=CARD_SEGS[cardIdx];
+    const ok=seg.req();
+    if(ok) cardElapsed+=dt;           // time banks ONLY while the requirement holds
     if(seg.dur>0 && cardElapsed>=seg.dur) cardAdvance();
   }
   cardBtn.setAttribute('aria-pressed',String(cardActive));
@@ -135,7 +145,10 @@ function driveCardTick(){
   if(cardActive){
     const seg=CARD_SEGS[cardIdx], remain=Math.max(0,seg.dur-cardElapsed);
     cardSegEl.style.display='';
-    cardSegEl.textContent=seg.dur>0?(seg.prompt+' · '+remain.toFixed(1)+'s'):seg.prompt;
+    const ok=seg.req();
+    cardSegEl.className=ok?'chip':'chip notice';   // yellow until you comply
+    cardSegEl.textContent=seg.dur>0?(seg.prompt+' · '+remain.toFixed(1)+'s'+(ok?'':' — waiting'))
+                                   :seg.prompt;
   } else if(simT-cardDoneAt<CARD_DONE_GRACE){
     cardSegEl.style.display=''; cardSegEl.textContent='card complete';
   } else cardSegEl.style.display='none';
