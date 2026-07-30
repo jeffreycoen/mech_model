@@ -1,5 +1,5 @@
 # Biped Mech Walking — plug-in spec + reference code for Coldsnap
-### Distilled from mech_model Light Frame, MK1.43.0 (Claude Fable 5)
+### Distilled from mech_model Light Frame, MK1.43.0 (Claude Fable 5) — v3, adds §6 hinge/island for the contacts+welds engine
 
 Engine-agnostic JavaScript. Three drop-in modules: **scale**, **gait**, **servo** — plus
 the contact recipe and the two design constraints code can't fix. Everything derives from
@@ -266,15 +266,99 @@ function tuneDamper(mu, wSway, I_aboutHinge, m, leverToCoM, g, hangs) {
 
 ---
 
-## 6. Port order
+## 6. Hinge joint for a contacts+welds engine (the Coldsnap gap)
 
-1. §1 scale module — including the √s timestep. Verify: gamma identical at two sizes.
-2. §4 servo law + caps, §3 swing profile, ground recipe.
-3. §2 stepping: plan → swingTarget → copCommand → standCatch → planStop → ramp.
-4. §0 mass layout on the art rig (this is a *design* gate, not code).
-5. §5 dampers on whatever hangs off the hull.
+The engine has contacts and welds only (3 linear axes + diagonal-approx full angular
+lock). A mech needs a hinge: **weld's linear part + two axis-projected angular locks +
+motor torque on the free axis.** ~150 lines. Reference below is written for a
+single-velocity-pass solver at fixed `dt = 1/120`; position-level (XPBD) notes inline.
 
-1–3 walks. 4 decides whether it *keeps* walking. 5 makes it feel planted.
+```js
+// ---- hinge constraint, velocity level -------------------------------------
+// Locks: 3 linear (reuse weld point-to-point at the anchor), 2 angular.
+// Free axis: world hinge axis from body A.  a1 = A.rot(axisLocalA).
+// The two locked axes p1, p2 complete an orthonormal frame with a1.
+//
+// Angular locks (each axis n of p1,p2):
+//   Cdot = dot(wB - wA, n)                      // relative spin off-axis
+//   Cpos = dot(orientationError(A,B), n)        // drift, for Baumgarte
+//   lambda = -(Cdot + beta/dt * Cpos) / (nT*(IinvA + IinvB)*n)
+//   apply +lambda*n to B, -lambda*n to A        // angular impulse
+// beta = 0.2 at 1/120. USE THE FULL PROJECTED INVERSE INERTIA nT*Iinv*n here,
+// not the diagonal approximation: the locked axes of a limb are exactly where
+// non-principal terms show up, and a diagonal shortcut leaks energy into the
+// spin the servo then has to fight. (Assert at build time that each link's
+// hinge frame is within ~10 deg of principal axes if you keep the shortcut.)
+```
+
+```js
+// ---- motor about the free axis, IMPLICIT damping --------------------------
+// This kills stability-cap landmine #2 outright. Compute once per tick:
+//   e    = wrapPi(target - angle)               // angle via atan2 of projected refs
+//   wRel = dot(wB - wA, a1)
+//   Ieff = 1 / (a1T*IinvA*a1 + a1T*IinvB*a1)    // effective inertia about axis
+// Implicit velocity-level damper (unconditionally stable at ANY kd):
+//   wNew   = (wRel + (kp*e + tauFF) * dt / Ieff) / (1 + kd * dt / Ieff)
+//   tauReq = (wNew - wRel) * Ieff / dt          // torque implied by the update
+//   tau    = clamp(tauReq, -tauMax, +tauMax)    // ceiling AFTER, so clamp wins
+//   apply angular impulse tau*dt about a1 (+B, -A)
+// Accumulate tau*dt as a clamped multiplier if your solver iterates; do NOT
+// re-derive from scratch each iteration or the clamp is per-iteration, not total.
+// kv (quadratic damper): fold into kd per tick as kdEff = kd + kv*|wRel| before
+// the implicit step — same unconditional stability.
+//
+// If you keep an EXPLICIT damper instead (tau = kp*e - kd*wRel applied openly),
+// the caps are mandatory and assertable at build time:
+//   kd*dt/I  < 1        (2 = divergence; past it the joint bang-bangs the
+//                        ceiling at 9-21 Hz and shakes the whole machine)
+//   kp*dt*dt/I < 1      (this one diverges WITH more iterations, not fewer —
+//                        soften kp, don't iterate harder)
+//   (kd + 2*sqrt(tauMax*kv))*dt/I < 2
+// At dt=1/120 on a large-L mech all three pass with margin — big mechs are the
+// favorable regime; the caps exist so a future small mech fails LOUDLY at build.
+```
+
+```js
+// ---- end stops -------------------------------------------------------------
+// A stop is a one-sided angular constraint with FINITE compliance (elastomeric
+// bumper, ~1e-7 rad per N·m at our reference torques) and its impulse counts
+// toward the mount's failure/damage budget. A rigid stop with a discarded
+// multiplier can silently carry 40 kN·m and read zero in telemetry — measured.
+```
+
+```js
+// ---- solver LOD exemption (landmine #1) ------------------------------------
+// The global solver drops 12 -> 4 iterations past 900 active constraints, i.e.
+// exactly when the mech is knee-deep in rubble. The mech gets its OWN island
+// with fixed iterations, and the island includes its FOOT CONTACTS — balance
+// authority is contact-solve quality as much as joint stiffness. Our chain
+// needed 8 interleaved sweeps: 6 walks in place but falls when travelling.
+function stepMechIsland(mech, dt, IT = 10) {   // IT fixed; NEVER tied to LOD
+  for (let it = 0; it < IT; it++) {
+    for (const j of mech.joints)  j.solve(dt);      // hinges (above)
+    for (const c of mech.contacts) c.solve(dt);     // this mech's feet vs ground
+  }                                                  // INTERLEAVED, same loop
+}
+// In stepWorld: solve the world normally but EXCLUDE mech-owned constraints
+// from the LOD-tiered pass; run stepMechIsland at fixed cost instead. A 10-joint
+// mech + 8 foot-corner contacts at 10 iterations is ~180 constraint solves —
+// constant, tiny next to a 900-constraint demolition, and the mech never sags.
+// Rubble resting ON the mech still couples through the shared bodies; if rubble
+// jitter feeds back, promote contacts that touch mech bodies into the island too.
+```
+
+---
+
+## 7. Port order
+
+1. §6 hinge + mech island — the engine gap; nothing works without it.
+2. §1 scale module — including the √s timestep. Verify: gamma identical at two sizes.
+3. §4 servo law + caps, §3 swing profile, ground recipe.
+4. §2 stepping: plan → swingTarget → copCommand → standCatch → planStop → ramp.
+5. §0 mass layout on the art rig (this is a *design* gate, not code).
+6. §5 dampers on whatever hangs off the hull.
+
+1–4 walks. 5 decides whether it *keeps* walking. 6 makes it feel planted.
 
 Tuning order if it misbehaves: mass layout → timestep scaling → kd caps → kCapture
 (lower it if catches overshoot and ring) → agility AG. Everything else stays derived.
