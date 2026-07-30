@@ -5,6 +5,20 @@ function toggleTel(){ if(innerWidth>=900) return;
 telHd.addEventListener('click',toggleTel);
 telHd.addEventListener('keydown',function(e){ if(e.key==='Enter'||e.key===' '){e.preventDefault();toggleTel();} });
 
+/* ---------- strip placement on narrow screens (MK1.41.0) ----------
+   The preset bar is fixed top-right and 300 px wide; on a phone it covers x~130-430, which
+   is most of the strip's first row -- the phone screenshot showed every chip after the
+   first either ghosted under the bar or clipped. Below 700 px the strip drops BELOW the
+   bar, measured, not guessed, so a taller bar (open picker) pushes it down too. */
+(function placeStrip(){
+  const strip=document.getElementById('strip'), bar=document.getElementById('presetBar');
+  if(!strip||!bar) return;
+  const apply=()=>{ strip.style.top=innerWidth<700?(bar.getBoundingClientRect().bottom+6)+'px':'10px'; };
+  addEventListener('resize',apply);
+  bar.addEventListener('click',()=>setTimeout(apply,50));
+  apply();
+})();
+
 /* ---------- capturability light ----------
    capState (0 green / 1 yellow / 2 red) and accVec are written once per display frame by
    the loop in 11-loop.js, before it calls renderHudExtras(). fallen forces red defensively
@@ -13,7 +27,7 @@ telHd.addEventListener('keydown',function(e){ if(e.key==='Enter'||e.key===' '){e
 const capEl=document.getElementById('c-cap'),
       capDot=document.getElementById('c-cap-dot'),
       capLabel=document.getElementById('c-cap-label');
-const CAP_LABEL=['balanced','stepping margin','beyond recovery'];
+const CAP_LABEL=['balanced','stepping','beyond'];   // fixed 9ch chip width, see shell CSS
 const CAP_CLASS=['chip','chip notice','chip warn'];
 const CAP_COLOR=['var(--low)','var(--mid)','var(--high)'];
 

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <!-- Placeholder. The live title is set from BUILD_TITLE in core/preamble.js so the
      version cannot drift between the tab, the HUD and the session log. -->
-  <title>MK1 Live Rig — Claude Opus 5 (1M context)</title>
+  <title>MK1 Live Rig — Claude Fable 5</title>
 <style>
   :root{
     --paper:#E8E4DA; --paper-2:#DED9CD; --ink:#1C1F1A; --rule:#A8A296;
@@ -39,6 +39,10 @@
      using the same .chip/.chip.warn rules everything else in #strip already uses. */
   .capdot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;
     vertical-align:middle;background:var(--low)}
+  /* Fixed width: the label is one of three words; letting the chip resize with the word
+     moved every chip after it (review of the phone screenshot, MK1.41.0). */
+  #c-cap-label{display:inline-block;width:9ch}
+  @media (max-width:700px){ #c-rate{display:none} }
 
   #presetBar{position:fixed;right:10px;top:10px;z-index:7;width:min(300px,calc(100vw - 20px));
     border:1px solid var(--ink);background:rgba(232,228,218,.95)}
@@ -157,12 +161,12 @@
 <div id="strip">
   <div class="striprow">
     <div class="chip" id="c-mass">— · <b>—</b></div>
-    <div class="chip" id="c-rate">— fps</div>
-    <div class="chip" id="c-speed">0.00 m/s</div>
-    <div class="chip" id="c-steps">0 steps</div>
-    <div class="chip" id="c-state">standing</div>
     <div class="chip" id="c-cap"><i class="capdot" id="c-cap-dot"></i><span id="c-cap-label">balanced</span></div>
     <button class="chip" id="c-card" style="pointer-events:auto">CARD</button>
+    <div class="chip" id="c-state">standing</div>
+    <div class="chip" id="c-speed">0.00 m/s</div>
+    <div class="chip" id="c-steps">0 steps</div>
+    <div class="chip" id="c-rate">— fps</div>
   </div>
   <div class="striprow">
     <div class="chip" id="c-card-seg" style="display:none">—</div>
