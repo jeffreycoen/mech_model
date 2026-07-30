@@ -20,14 +20,15 @@ const ATST_SPEC = {
   ankle: [-0.15, 0.175, 0],
   links: {
     // hip carriage: the box the legs actually hang from
-    /* BALLAST EXPERIMENT (MK1.44.0). 1100 -> 3325 kg: dead mass in the hip carriage to
-       take the hull from 40% to 60% of the machine -- the Light Frame's regime, where the
-       point-mass planner is approximately true. This is a DIAGNOSTIC: if leg-mass
-       fraction is why the Scout falls 6x per card where the Light falls once, this fixes
-       it; if it drives no better, that diagnosis is falsified and the ballast comes out.
-       Density lands at 850 kg/m^3 (was 281) -- solid machinery, not lead. Every derived
-       quantity follows automatically: TMD mu, gait omega, ground compliance, torque
-       ratios (single-leg rule drops to ~1.35x, still over 1). Canon untouched. */
+    /* DRIVETRAIN IN THE HIP CARRIAGE (MK1.44.0). 1100 -> 3325 kg -- powerplant, drives
+       and fuel where a designer puts them: low, between the legs that draw the power.
+       Bulk density 850 kg/m^3, a third of an engine block; the gyro flywheel already
+       mounts here. Takes the hull from 40% to 60% of the machine -- the regime where the
+       point-mass planner is approximately true -- and lowers the CoM, which helps on its
+       own. Shipped as a diagnostic for the leg-mass hypothesis and CONFIRMED on the card:
+       falls per card 6 -> 1 (log s20260730214521), the Light Frame's level, dying in the
+       same segment (walkturn). Every derived quantity followed automatically: TMD mu,
+       gait omega, ground compliance, single-leg torque ratio ~1.35x (still over 1). */
     pelvis: { mass: 3325, dim: [2.00, 0.85, 2.30] },
     // the cockpit is the machine. 4 500 kg of it, centred 1.75 m above the hip line.
     /* Waist ring, same idiom as MK1 -- and on this silhouette it is the cockpit that
