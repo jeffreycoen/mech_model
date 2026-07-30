@@ -1,5 +1,5 @@
 # Biped Mech Walking — plug-in spec + reference code for Coldsnap
-### Distilled from mech_model Light Frame, MK1.43.0 (Claude Fable 5) — v3, adds §6 hinge/island for the contacts+welds engine
+### Distilled from mech_model Light Frame, MK1.43.0 (Claude Fable 5) — v4: hinge/island (§6), ground-vs-Baumgarte settled (§4), headless gate (§7)
 
 Engine-agnostic JavaScript. Three drop-in modules: **scale**, **gait**, **servo** — plus
 the contact recipe and the two design constraints code can't fix. Everything derives from
@@ -238,6 +238,18 @@ groundCompliance = (0.01 * L) / (totalMass * g);     // m/N   (scales s^-2 — s
 groundDampingWeight = 1.0;                            // XPBD damping weight, or your
                                                       // engine's equivalent of
                                                       // "critically damped, e=0"
+//
+// STIFF BAUMGARTE TERRAIN (bias ~0.2/dt, restitution gated above a closing-speed
+// threshold): probably fine for WALKING as-is — sin^2 zeroes the commanded
+// touchdown speed, so nominal landings stay far under a 1.6 m/s gate and warm
+// starts absorb the rest. (Caveat: we never isolated sin^2 on rigid ground;
+// profile and crush shipped together.) The case that bites is the BLAST/FALL:
+// a thrown mech closes above the gate, restitution opens, and the bounce pumps
+// energy back into the rig — the exact flail-and-tear mode the zero-e rule
+// exists to kill. Insurance, in order:
+//   1. restitution = 0 on ALL mech-body contacts (one flag, no global parity hit)
+//   2. per-foot compliance INSIDE the mech island (§6) if the headless gate
+//      shows standing chatter or landing spikes — global terrain untouched
 // Torque sizing: EVERY leg joint holds the whole machine on one leg:
 // tauMax >= totalMass * g * lever_in_single_support. Size the ceiling for that,
 // but tune kp to a SEPARATE reference torque — raising the ceiling must not
@@ -349,16 +361,37 @@ function stepMechIsland(mech, dt, IT = 10) {   // IT fixed; NEVER tied to LOD
 
 ---
 
-## 7. Port order
+## 7. Headless acceptance gate
+
+"Stands, walks 20 m, eats a mortar" — plus the cheap asserts that caught our worst bugs:
+
+```js
+// build-time (no stepping):
+assert(touchdownSlope(swingLift) ≈ 0);         // finite-diff at s=0.999 vs mid-swing peak
+assertStabilityCaps(everyJoint);               // §6: kd·dt/I, kp·dt²/I, kv bound
+assertNoNaNorUndefined(builtRig, at 2 scales); // every derived constant, both sizes
+assert(gammaIdentical(scaleA, scaleB));        // kd/(kp·dt) per joint, exact
+// stepped (the gate itself):
+stands 10 s, |accel| quiet;  walks 20 m without a fall;
+mortar impulse -> falls -> ASSERT walk controller stopped and servos limp
+(a walk controller driving a downed mech is the tear-everything mode);
+respawn -> stands again.
+```
+
+---
+
+## 8. Port order
 
 1. §6 hinge + mech island — the engine gap; nothing works without it.
 2. §1 scale module — including the √s timestep. Verify: gamma identical at two sizes.
-3. §4 servo law + caps, §3 swing profile, ground recipe.
+3. §4 servo law + caps, §3 swing profile, ground recipe (+ e=0 on mech contacts).
 4. §2 stepping: plan → swingTarget → copCommand → standCatch → planStop → ramp.
 5. §0 mass layout on the art rig (this is a *design* gate, not code).
 6. §5 dampers on whatever hangs off the hull.
+7. §7 gate wired into CI before tuning starts — every bug we lost days to was a
+   number that was wrong when typed and had no check.
 
-1–4 walks. 5 decides whether it *keeps* walking. 6 makes it feel planted.
+1–4 walks. 5 decides whether it *keeps* walking. 6 makes it feel planted. 7 keeps it true.
 
 Tuning order if it misbehaves: mass layout → timestep scaling → kd caps → kCapture
 (lower it if catches overshoot and ring) → agility AG. Everything else stays derived.
