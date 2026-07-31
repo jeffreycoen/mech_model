@@ -1,5 +1,5 @@
 # Biped Mech Walking — plug-in spec + reference code for Coldsnap
-### Distilled from mech_model Light Frame, MK1.43.0 (Claude Fable 5) — v4: hinge/island (§6), ground-vs-Baumgarte settled (§4), headless gate (§7)
+### Distilled from mech_model Light Frame, MK1.43.0 (Claude Fable 5) — v5: complete. Adds gyro, waist/turret, steering rings, mounts+damage, command model, spawn, sensors, ensemble gate
 
 Engine-agnostic JavaScript. Three drop-in modules: **scale**, **gait**, **servo** — plus
 the contact recipe and the two design constraints code can't fix. Everything derives from
@@ -278,6 +278,126 @@ function tuneDamper(mu, wSway, I_aboutHinge, m, leverToCoM, g, hangs) {
 
 ---
 
+## 5b. Gyro (CMG) — the attitude battery
+
+Without it our reference biped survived 3/5 runs with 29 joints torn; with it, 5/5 and
+none. It is a control-moment gyro: stores angular momentum, trades it for righting torque.
+
+```js
+// Sizing (fractions of machine, measured working):
+//   flywheel mass ≈ 3% of machine        tauMax ≈ 0.13 * (machineWeight * comHeight)
+//   hMax (momentum store) ≈ tauMax * 0.5s-worth   kp/kd: slow outer attitude PD
+// Scaling: mass s^3, tauMax s^4, hMax s^4*sqrt(s), kd s^4*sqrt(s).
+// MOUNT TO THE HEAVIEST BODY. Mounting to a light body (our 157 g torso vs 373 g
+// pelvis) reacts the flywheel against the thing least able to absorb it and tears
+// the mounts around it. The flywheel is REAL mass: add it to the mount body BEFORE
+// deriving anything (it moved our absorber tuning 1.24% when added after).
+function cmgTick(cmg, bodyQuat, targetYaw, dt) {
+  // attitude error -> desired torque (PD on tilt+yaw), slew-limited at
+  // tauMax / (stepPeriod/1.5)  — an outer loop SLOWER than the gait, never faster
+  // torque only while |h| < hMax: momentum saturates, then you have nothing —
+  // desaturate by bleeding h against the ground through the stance legs, time
+  // constant ~7s * sqrt(s). HUD the store: drivers must see the battery drain.
+  // Reference the same balance target the ankles use (planned ZMP), or the gyro
+  // brakes every ordinary step as if it were a fall.
+}
+```
+
+## 5c. Waist/turret ring and the two yaws
+
+Twin-stick: left stick = travel vector, right stick = **torso aim**. These are different
+yaws and conflating them caused a whole class of bugs:
+
+- `bodyYaw` — the chassis. Everything about heading, stepping, stabilising reads this.
+- `torsoAngle` — the turret. Aim only. Never steer, cap, or stabilise against it.
+
+```js
+// Waist = one hinge (§6) between hull and torso, range ±50°, servo'd to
+// aim - bodyYaw,  SLEW-LIMITED: waistRate = fullTravel / (1 pendulum-scaled s).
+// Unslewed, one frame stepped the target 100° and hit the stop at 37 rad/s —
+// tore both arms and the head off in 5 sessions of 6. EVERY channel gets a rate.
+// waistFollow = 0.6: legs start walking the chassis around only once the ring
+// has used 60% of its travel — aim is instant, chassis rotation is earned.
+```
+
+## 5d. Steering: hip-yaw rings
+
+Turning is delivered by a yaw ring at the top of each leg, NOT by the gyro dragging the
+machine against foot friction (~4°/step, all it can do alone).
+
+```js
+// - Ring limits/slew DERIVE from the rig's own end stops: limit = 0.9 * stopRange,
+//   rate = fullTravel / stepPeriod. Never restate them controller-side.
+// - Steer ONLY during single support: stance ring turns the chassis over the
+//   planted foot, swing ring pre-rotates the landing foot. In double support both
+//   feet are planted — commanding the rings just grinds the soles.
+// - ONE turning parameter: yawPerStep (8° standard, 5° tall/narrow rigs).
+//   turnRate = yawPerStep / stepPeriod. The stick integrates a HEADING at
+//   turnRate; never step the heading by thumb position.
+```
+
+## 5e. Mounts, damage, and structural rules
+
+Every joint/weld carries a failure envelope — the game's damage model plugs in here.
+
+```js
+// Four load channels per mount, quadrature sum:
+//   util = sqrt((tension/limT)^2 + (shear/limS)^2 + (bend/limB)^2 + (torsion/limQ)^2)
+// util >= 1 -> break (accumulate damage below 1 if you want wear).
+// Compression does NOT count toward tension. End-stop reaction torque COUNTS
+// toward the same mount (a rigid stop silently carried 40 kN·m in ours).
+// Rules that held up:
+//   limits scale: tension/shear s^3, bend/torsion s^4  (Froude)
+//   forgiveness: gameplay limits = engineering limits * ~4 (ordinary driving
+//     must never tear; only abuse and falls do)
+//   proximal leg joints sized so EITHER leg holds the whole machine (tau >= m*g*lever)
+//   ankle tauMax is DERIVED from the CoP box: pitch ≈ 1.40*W*copLimitX,
+//     roll ≈ 1.45*W*copLimitZ — the balance zone and the ankle ceiling are ONE
+//     rule at two sites; change one, change the other.
+```
+
+## 5f. Command model, spawn, and the traps
+
+```js
+// COMMAND MODEL: stick -> want (slewed at travelRate/turnRate) -> latched ONCE
+// PER STEP at touchdown. The gait executes the latched stride; mid-swing command
+// changes wait for the next step (except aborting a stop — only when both feet
+// are down; aborting mid-swing yanks the catch target).
+// wantsMove = travel beyond deadband OR heading error beyond what a step fixes.
+//   TRAP: a leftover heading RESIDUAL after releasing the turn stick must NOT
+//   count as "wants to move" — ours marched in place forever. A driver who wants
+//   motion pushes a stick; a residual decays.
+// SPAWN: settle (both feet loaded, ~0.4s-scaled) -> crouch ramp to walk height
+//   (~1.4s-scaled) -> only then control authority. Cold-starting servos at full
+//   gain on frame 1 = the machine jumps. Rise/crouch rate ≈ 1.5 pelvisDrop/s.
+// GOVERNOR TRAP: do NOT add a torque-rate limiter below servo bandwidth "for
+//   realism". Servo loops run 100-460 Hz equivalent; an 81 ms torque slew under
+//   them is a textbook limit cycle — ours blew all three rigs apart ON SPAWN.
+//   If you want one, it must cross full range in < 2 servo periods (= useless
+//   against 9-21 Hz chatter, so just don't).
+// FOOT PAIR: add foot-vs-foot non-penetration (one box-box constraint) AND make
+//   the planner respect it (minFootSep) — a planner that commands overlap fights
+//   the solver and falls. Both, not either.
+```
+
+## 5g. Sensors
+
+Control reads engine ground truth (position, velocity, contact forces) — standard for a
+game, no estimator needed. Two derived instruments are worth porting anyway:
+
+```js
+// Ideal IMU: pelvis dv/dt per tick — drives the HUD strip chart and the headless
+// gate's "stands quietly" assert (|a| p95 under ~5 m/s^2 driven-scale standing).
+// Capturability light (HUD + telemetry), green/yellow/red:
+//   green : xi inside the ankle box (copLimit ⊕ halfStance laterally) — stable
+//   yellow: outside, but within one catch step's reach — machine should be stepping
+//   red   : beyond any single step — physically unrecoverable, expect the fall
+// It warned 0.08-0.92s ahead of 5 of 6 real falls. Cheap and it makes failures
+// legible to players and to CI alike.
+```
+
+---
+
 ## 6. Hinge joint for a contacts+welds engine (the Coldsnap gap)
 
 The engine has contacts and welds only (3 linear axes + diagonal-approx full angular
@@ -376,6 +496,10 @@ stands 10 s, |accel| quiet;  walks 20 m without a fall;
 mortar impulse -> falls -> ASSERT walk controller stopped and servos limp
 (a walk controller driving a downed mech is the tear-everything mode);
 respawn -> stands again.
+// ENSEMBLES, NOT SINGLE RUNS. The walk is deterministic but chaotic: a 1.9e-16
+// relative parameter change moved a fall from 178 s to 23 s in ours. Gate on
+// N=5 runs with nanometre-scale spawn jitter and count survivals; a single
+// passing trajectory is noise shaped like success.
 ```
 
 ---
