@@ -269,6 +269,27 @@ function planStop(com, comVel, feetMid, k, g) {
 ```
 
 ```js
+// RELEASE RECOVERY — the full sequence when the driver lets go mid-stride:
+//   1. Current swing finishes normally (its capture correction is already
+//      committed — never abort a swing to stop).
+//   2. At touchdown, stopping begins: ONE closing step, aimed by planStop() at
+//      the capture point measured at release — this step absorbs the travel
+//      momentum. It is a normal swing (sin^2 lift, clamps) with a frozen aim.
+//   3. Its touchdown runs the DCM plan's tEnd tail: the ZMP walks to the centre
+//      of the final pair and the CoM decays onto it (§2b closed forms). Stand.
+//   4. Off-square rest (fore-aft print offset > 15% of stance)? ONE squaring
+//      step, capped at one retry — never loop; an imperfect square is stable,
+//      marching in place is not.
+//   5. From STAND onward, standCatch() is the backstop: any residual or outside
+//      disturbance that pushes xi past the ankle box fires a catch step — same
+//      machinery, no cooldown, as many as it takes.
+// The contract: hands off ALWAYS ends in a squared standing mech, through
+// however many catch steps the momentum needs. Turn residue must not block it
+// (§5f yaw-residual trap): only a real travel command aborts a stop, and only
+// with both feet down.
+```
+
+```js
 // Cadence ramp — crane rule. First plan out of a stand runs 1.35x-long phases,
 // decaying 60% of the excess per step. Stopping ramps out via the plan's tail.
 function rampedTimes(k, rampK) { return { tSS: k.tSS * rampK, tDS: k.tDS * rampK }; }
