@@ -54,6 +54,33 @@ a channel.
 
 ---
 
+## 0c. Reference rig proportions — the working biped, ratios only
+
+Mass fractions of total machine; dimensions as fractions of machine height H.
+Leg length L = 0.60·H (thigh 0.49·L + shin 0.51·L). Hull (pelvis+torso+head+arms) = 65%.
+
+```
+part       count  mass%   dims (x,y,z as frac of H)      role
+pelvis       1    33.5    0.183, 0.126, 0.397            hip carriage; heaviest body; gyro mounts here
+torso        1    14.4    0.275, 0.118, 0.418            on the waist ring; arms/head hang off it
+head         1     3.8    0.173, 0.102, 0.224            the fuse (weakest mount, §5e)
+upperArm     2     8.4    0.086, 0.193, 0.086            passive damper (§5)
+foreArm      2     4.8    0.073, 0.163, 0.073            passive damper
+hipYaw ring  2     2.6    0.094, 0.061, 0.094            steering (§5d)
+hipYoke      2     2.9    0.077, 0.069, 0.077            roll hinge
+thigh        2    10.8    0.102, 0.305, 0.102            hollow beam, wall a/t ~60
+shin         2     7.2    0.086, 0.295, 0.086            hollow beam
+ankleYoke    2     2.2    0.069, 0.061, 0.069            pitch ankle
+foot         2     9.6    0.193, 0.061, 0.224            0.20*H long; ankle 7% behind centre
+```
+
+Placement (fractions of H): hip line at 0.60; feet ±0.073 lateral of centreline
+(stance = 0.146·H = 0.245·L); waist ring at 0.72; shoulders at 0.80, ±0.21 lateral.
+COM standing ≈ 0.58·H. Hollow-beam sanity: section/wall ratio a/t < 150 or the leg
+is paper (ours run 60–96).
+
+---
+
 ## 1. Scale module — build-time, once per mech size
 
 ```js
@@ -250,20 +277,28 @@ function rampedTimes(k, rampK) { return { tSS: k.tSS * rampK, tDS: k.tDS * rampK
 
 ```js
 // Linear inverted pendulum: comAccel = omega^2 * (com - zmp), omega = sqrt(g/zc).
-// DCM (capture point) xi = com + comVel/omega obeys FIRST-ORDER dynamics:
-//   xiDot = omega * (xi - zmp)          // xi flees the ZMP exponentially
-// which integrates in closed form over any interval where zmp is constant/linear.
-// PLAN, built from the footprint list (each print = a ZMP anchor):
-//   - piecewise ZMP: at the stance foot during SS; travels linearly between the
-//     two feet during DS; ends centred between the final pair (tEnd runout).
-//   - integrate xi BACKWARD from the end (terminal xi = final ZMP = at rest):
-//       xi(t) = zmp + (xi(t+dt) - zmp) * exp(-omega*dt)
-//     backward integration is what makes the plan STABLE to follow.
-//   - com reference then follows forward: comDot = -omega * (com - xi).
-// TRACKING at runtime (§2 copCommand): commanded zmp = zmpRef + kDCM*(xiMeas -
-// xiRef), kDCM > 1 gives stable error dynamics — textbook DCM result.
-// ~80 lines total with the phase bookkeeping. If you shortcut anything, shortcut
-// the com tracker (pelvis at commanded velocity), never the backward xi pass.
+// DCM (capture point) xi = com + comVel/omega. Differentiate and substitute:
+//   xiDot = comVel + comAccel/omega = omega*(com - zmp) + comVel
+//         = omega*(com + comVel/omega - zmp) = omega*(xi - zmp).       (1)
+// CLOSED FORMS over one phase [0,T] (all you need — no references):
+//   zmp constant p:            xi(t) = p + (xi0 - p) * e^(omega*t)
+//   backward (from xi at T):   xi(t) = p + (xiT - p) * e^(-omega*(T-t))
+//   zmp linear p(t)=p0+(p1-p0)*t/T:  let v=(p1-p0)/T:
+//       xi(t) = p(t) + v/omega + (xi0 - p0 - v/omega) * e^(omega*t)
+//       (same shape backward with e^(-omega*(T-t)) and xiT anchor)
+// PLAN, from the footprint list:
+//   phases = [tStart | DS(tDS): zmp linear old->new foot | SS(tSS): zmp = stance
+//   foot | ... | tEnd: zmp -> centre of final pair]
+//   1. set terminal xi = final zmp (at rest), sweep BACKWARD phase by phase with
+//      the closed forms above, storing xi at each boundary. Backward is what
+//      makes the plan stable to follow — forward integration amplifies e^(wt).
+//   2. com reference forward:  com(t+dt) = xi(t) + (com(t) - xi(t)) * e^(-omega*dt)
+//      (from comDot = -omega*(com - xi), the stable half of the LIP split).
+// TRACKING at runtime (§2 copCommand): commanded zmp = zmpRef + kDCM*(xiMeas-xiRef).
+// Why kDCM > 1 is stable — substitute into (1):
+//   errDot = omega*err - omega*kDCM*err = omega*(1-kDCM)*err  -> decays for kDCM>1.
+// ~80 lines with phase bookkeeping. If you shortcut anything, shortcut the com
+// tracker (pelvis at commanded velocity), never the backward xi pass.
 ```
 
 **Footprints, in one paragraph.** Keep footprints for N=4 steps ahead: alternate feet,
