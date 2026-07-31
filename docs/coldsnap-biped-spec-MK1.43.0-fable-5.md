@@ -120,8 +120,43 @@ function deriveGait(L, comH, halfStance, foot, g = 9.81) {
 
 ## 2. Gait module — the balance core, one call per tick
 
-The full state machine (double/single support alternation, close-step on stop, squaring)
-is ordinary game code; below are the parts that make it *balance*. `k` is `deriveGait()`.
+### 2a. How a step actually works — the full cycle
+
+```js
+// STATES: STAND -> [DS -> SS-L -> DS -> SS-R -> ...] -> (closing step) -> STAND
+// Phase clock: tPlan advances against the plan's phase list
+//   [ tStart | DS,SS alternating at tDS,tSS | tEnd runout ]
+//
+// Per tick, in THIS order (order is load-bearing):
+//   1. ref  = plan.at(tPlan)            // CoM + ZMP references for this instant
+//   2. xi   = capturePoint(measured)    // and xiErr = xi - plan's xi
+//   3. feet:
+//        stance foot: target = its planted print (NEVER moves)
+//        swing foot : swingTarget(s, ...) — s = phase fraction inside SS
+//   4. cop  = copCommand(...)           // -> stance ankle tauFF
+//   5. IK(pelvisRef from plan, feet)    // -> joint targets
+//   6. servos run (§4/§6) inside the physics island
+//
+// DS (double support, tDS): both feet planted. The ZMP reference travels from
+//   the old stance foot toward the new one — weight transfer is COMMANDED by the
+//   plan, not left to chance. No steering (both feet planted = rings grind).
+// SS (single support, tSS): stance leg carries and steers (hip-yaw ring),
+//   swing leg follows swingTarget: horizontal smoothstep from lift-off print to
+//   (planned print + committed capture correction), vertical sin^2 lift.
+// TOUCHDOWN (the handshake, once per step — most bugs live here):
+//   - MEASURE where the foot actually landed; that becomes the print (pin its
+//     lateral toward nominal stance ~20%/step or stance narrows and legs cross)
+//   - advance the tracked pair-centre by the commanded travel (sagittal slaved
+//     to measurement so travel stays honest; lateral stays commanded = no drift)
+//   - LATCH the slewed command as next step's stride; replan the DCM references
+//     from the measured feet; alternate the swing side; clear per-step holds
+//   - stopping? -> this was the closing step: stand. no command? -> start one.
+// STAND: both planted, balance loop + catch trigger (§2 standCatch) only.
+//   Off-square rest (feet > 15% of stance apart fore-aft) => ONE squaring step.
+```
+
+The remaining glue (state enum, respawn, warm-up §5f) is ordinary game code. Below are
+the balance functions the cycle calls. `k` is `deriveGait()`.
 
 ```js
 // Capture point: where the machine stops if it plants a foot there. THE quantity.
@@ -387,6 +422,24 @@ Every joint/weld carries a failure envelope — the game's damage model plugs in
 //   ankle tauMax is DERIVED from the CoP box: pitch ≈ 1.40*W*copLimitX,
 //     roll ≈ 1.45*W*copLimitZ — the balance zone and the ankle ceiling are ONE
 //     rule at two sites; change one, change the other.
+//
+// MOUNT STRENGTH TABLE (dimensionless, multiply out per machine; W = m*g,
+// mgL = m*g*legLength, all at the machine's own scale — Froude-safe by
+// construction). Measured-good on the reference biped; envelope knob and the
+// x4 forgiveness apply on top:
+//   mount      T/W    S/W    B/mgL  Q/mgL
+//   torso     10.97   9.75   2.480  2.067   // waist ring carries everything above it
+//   head       2.93   2.44   0.372  0.248   // deliberately the fuse up top
+//   upperArm   5.37   4.39   0.785  0.207
+//   foreArm    4.39   3.66   0.579  0.124
+//   hipYaw     5.12   4.15   0.868  0.909
+//   hipYoke    5.12   4.15   0.868  0.785
+//   thigh      5.12   4.15   0.868  1.075
+//   shin       4.63   3.66   0.744  1.075
+//   ankleYoke  4.27   3.41   0.620  0.302   // raise x1.5 if backward walking tears
+//   foot       4.27   3.41   0.620  0.240   // them — ours did, we did
+// (T=tension limit, S=shear, B=bend, Q=torsion. Tension/shear scale s^3 with
+// weight; bend/torsion s^4 with mgL — that is why the table is stated this way.)
 ```
 
 ## 5f. Command model, spawn, and the traps
