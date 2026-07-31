@@ -246,7 +246,27 @@ function rampedTimes(k, rampK) { return { tSS: k.tSS * rampK, tDS: k.tDS * rampK
 // rampK: 1.35 on leaving STAND; after each replan rampK = 1 + (rampK-1)*0.6.
 ```
 
-**Plan (§2b), in one paragraph.** Keep footprints for N=4 steps ahead: alternate feet,
+### 2b. The DCM plan — the actual math
+
+```js
+// Linear inverted pendulum: comAccel = omega^2 * (com - zmp), omega = sqrt(g/zc).
+// DCM (capture point) xi = com + comVel/omega obeys FIRST-ORDER dynamics:
+//   xiDot = omega * (xi - zmp)          // xi flees the ZMP exponentially
+// which integrates in closed form over any interval where zmp is constant/linear.
+// PLAN, built from the footprint list (each print = a ZMP anchor):
+//   - piecewise ZMP: at the stance foot during SS; travels linearly between the
+//     two feet during DS; ends centred between the final pair (tEnd runout).
+//   - integrate xi BACKWARD from the end (terminal xi = final ZMP = at rest):
+//       xi(t) = zmp + (xi(t+dt) - zmp) * exp(-omega*dt)
+//     backward integration is what makes the plan STABLE to follow.
+//   - com reference then follows forward: comDot = -omega * (com - xi).
+// TRACKING at runtime (§2 copCommand): commanded zmp = zmpRef + kDCM*(xiMeas -
+// xiRef), kDCM > 1 gives stable error dynamics — textbook DCM result.
+// ~80 lines total with the phase bookkeeping. If you shortcut anything, shortcut
+// the com tracker (pelvis at commanded velocity), never the backward xi pass.
+```
+
+**Footprints, in one paragraph.** Keep footprints for N=4 steps ahead: alternate feet,
 each print = previous print + commanded stride (clamped to `strideCap`), lateral at
 nominal stance width. Replan at **every touchdown from the measured landing** — feet land
 short and the error compounds if you trust commands. Between prints, run the analytic
