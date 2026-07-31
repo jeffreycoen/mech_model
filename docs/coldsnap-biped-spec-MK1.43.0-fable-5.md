@@ -21,6 +21,39 @@ and leg IK (pelvis pose + foot pose → joint angles). Everything else is below.
 
 ---
 
+## 0b. Controls — what the driver holds
+
+Twin-stick. **Left stick moves, right stick aims.** They are independent and never share
+a channel.
+
+```js
+// LEFT STICK = TRAVEL VECTOR, camera-relative ("push away from me" is away at any
+// camera angle). Magnitude*strideCap -> want.travel, slewed at travelRate, latched
+// once per step at touchdown. Deadband 0.12.
+//   Release => ONE closing step to square the feet, then stand. Stopping is a
+//   manoeuvre, not a decay (§2 planStop). No auto-face: pushing sideways STRAFES;
+//   it never rotates the machine. Rotation belongs to the right side only.
+// RIGHT STICK = TORSO AIM, a HEADING (position command): the turret looks where
+// the thumb points, via the waist ring, immediately. Deadband 0.18 (atan2 of a
+// near-zero deflection is noise). Release => aim HOLDS (a gunner keeps aim).
+//   The chassis only steps around under the turret once the ring passes 60% of
+//   its travel (waistFollow) — aim is instant, chassis rotation is earned.
+// TURN BUTTONS (or bumpers) = chassis-turn RATE command: heading integrates at
+// turnRate (= yawPerStep/stepPeriod — what the legs can actually deliver).
+//   Prefer rate for big turns: a POSITION stick flicked across its face steps the
+//   heading by 100°+ in one frame and the ring/mounts absorb that step; an
+//   integrated rate never steps anything. If you keep only one turn control,
+//   make it the rate one.
+// CAMERA: fixed isometric detents (orbit in 45° clicks, zoom). Detents matter:
+//   camera-relative travel means a free-orbiting camera silently re-aims the
+//   travel vector mid-walk.
+// FEEL RULES, from driving: every channel slewed (§5f); aim latches, travel
+//   doesn't; releasing everything must always end in a squared, standing mech
+//   (catch steps included) — "hands off = safe" is the contract.
+```
+
+---
+
 ## 1. Scale module — build-time, once per mech size
 
 ```js
