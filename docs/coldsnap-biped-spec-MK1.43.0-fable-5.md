@@ -46,7 +46,12 @@ a channel.
 //   make it the rate one.
 // CAMERA: fixed isometric detents (orbit in 45° clicks, zoom). Detents matter:
 //   camera-relative travel means a free-orbiting camera silently re-aims the
-//   travel vector mid-walk.
+//   travel vector mid-walk. Frame bounds/zoom DERIVE from rig height like every
+//   other constant — a hardcoded span drew a small rig at 4% of the viewport.
+// PRECEDENCE: turn buttons run after and override the aim stick when both are
+//   held. Keyboard fallback if you want one: WASD travel, Q/E aim, arrows camera.
+// FEEDBACK: on any structural break, run the sim at 25% speed for ~1.5 s —
+//   a hit-stop that makes damage legible at no cost.
 // FEEL RULES, from driving: every channel slewed (§5f); aim latches, travel
 //   doesn't; releasing everything must always end in a squared, standing mech
 //   (catch steps included) — "hands off = safe" is the contract.
@@ -254,6 +259,10 @@ function standCatch(xi, feetMid, bodyAxes, k) {
     return { side: eL > 0 ? 'L' : 'R' };     // -> launch one step, swingTarget places it
   return null;
 }
+// KNOWN SHORTFALL (measured, warn-level in our CI): the lateral trigger distance
+// can exceed what one splay-clamped step can reach (~38% coverage on our narrow
+// rig). Wider stance or a raised splayMax closes it; check the geometry on YOUR
+// rig at build time rather than discovering it as unexplained lateral falls.
 ```
 
 ```js
@@ -372,7 +381,8 @@ tau = clamp(j.kp * (j.target - j.angle) - j.kd * wRel - j.kv * wRel * Math.abs(w
 ```js
 // BUILD-TIME STABILITY CAPS — assert these, they are why the servo doesn't buzz.
 // h = physics substep. I = child link inertia about the hinge axis.
-assert(j.kd * h / I < 1.0);                          // explicit damper stability (2 = divergence)
+assert(j.kd * h / I < 2.0);   // 2 = divergence bound. DESIGN to <= 1.0 (cap kd
+                              // per joint at build); assert the hard bound.
 assert((j.kd + 2 * Math.sqrt(j.tauMax * j.kv)) * h / I < 2.0);  // quadratic damper bound
 // gamma = kd/(kp*h) must come out IDENTICAL at every scale — cheapest scaling test.
 ```
@@ -410,6 +420,10 @@ groundDampingWeight = 1.0;                            // XPBD damping weight, or
 // Den Hartog tuning for anything that hangs off the hull (arms, pods, or a
 // dedicated internal bob at ~3% machine mass on a 2-axis gimbal).
 // mu = appendage mass / rest of machine;  wSway = omega from deriveGait.
+// VERIFY TUNING WITH AN INDEPENDENT RE-DERIVATION, never by calling this same
+// function and comparing to itself — a circular check certified an indexing bug
+// that silently zeroed every arm segment's own inertia in ours. Second
+// implementation from box dims + anchors, or the check checks nothing.
 function tuneDamper(mu, wSway, I_aboutHinge, m, leverToCoM, g, hangs) {
   const wT   = wSway / (1 + mu);
   const zeta = Math.sqrt(3 * mu / (8 * Math.pow(1 + mu, 3)));
@@ -445,7 +459,11 @@ function cmgTick(cmg, bodyQuat, targetYaw, dt) {
   // desaturate by bleeding h against the ground through the stance legs, time
   // constant ~7s * sqrt(s). HUD the store: drivers must see the battery drain.
   // Reference the same balance target the ankles use (planned ZMP), or the gyro
-  // brakes every ordinary step as if it were a fall.
+  // brakes every ordinary step as if it were a fall. The YAW reference is the
+  // gait's stabiliser heading, never the raw commanded facing — or the gyro
+  // grinds yaw torque through the soles of a machine standing still.
+  // ON A FALL: stop calling this entirely (§3) — no attitude authority on a
+  // machine with no attitude to save; the spinning store just tears mounts.
 }
 ```
 
@@ -496,7 +514,9 @@ Every joint/weld carries a failure envelope — the game's damage model plugs in
 //   limits scale: tension/shear s^3, bend/torsion s^4  (Froude)
 //   forgiveness: gameplay limits = engineering limits * ~4 (ordinary driving
 //     must never tear; only abuse and falls do)
-//   proximal leg joints sized so EITHER leg holds the whole machine (tau >= m*g*lever)
+//   proximal leg joints sized so EITHER leg holds the whole machine — measured
+//     per-joint fractions of m*g*L: hipYaw 0.50, hipYoke 0.58, thigh 0.78,
+//     shin 0.78 (asserted in CI, not documented in prose)
 //   ankle tauMax is DERIVED from the CoP box: pitch ≈ 1.40*W*copLimitX,
 //     roll ≈ 1.45*W*copLimitZ — the balance zone and the ankle ceiling are ONE
 //     rule at two sites; change one, change the other.
@@ -570,6 +590,28 @@ game, no estimator needed. Two derived instruments are worth porting anyway:
 //   live at sim rate, sampling channels alias them.
 // - Stamp EVERY log and artifact with the build version; derive the stamp from
 //   one constant. An unversioned log cost us a full driving session's diagnosis.
+//   And VERIFY THE SERVED/DEPLOYED build matches source before every hand-over —
+//   automate the check; a stale build silently cost a full session.
+// - UNITS AND PRECISION at the machine's own scale: log forces as FRACTION OF
+//   BODYWEIGHT (raw kN quantised to 0.37 W per count on a light rig and read as
+//   the machine leaving the ground) and torques in units where the working range
+//   keeps >= 3 significant digits (ours: kN·m at 2dp zeroed 91,295 samples
+//   across 11 sessions — every value logged exactly 0.00).
+// - SAMPLE RATE vs the signals: our 10 Hz channel aliased a 24.5 Hz leg-spring
+//   ring to 4.5 Hz — 0.4 Hz from the gait, indistinguishable from walking. Put
+//   the continuous channel at >= 2x the fastest structural mode you care about
+//   (we run 20 Hz + the sim-rate burst ring for everything faster).
+// - LOG EVERY PIPELINE STAGE, not the end product: stick -> want -> cmd ->
+//   active, and target vs achieved per joint. Twice a whole session was lost
+//   working out WHICH stage ate a command; the split answers it by inspection.
+// - More sensors that earned their place: friction-cone utilisation
+//   (|tangential|/(mu*normal) — "about to slip"), sole slip speed, CoP on BOTH
+//   axes (X-only blinded us to lateral, the axis that actually fails), and a
+//   burst trigger on |pelvis vY| > 0.5 m/s-scaled (hop/launch detection).
+// - HONEST FAILURE STATE in the HUD: on a fall FREEZE step/travel counters at
+//   fall-moment values, show DOWN, mark torn joints TORN (not a percentage),
+//   and banner the respawn. Before this, a collapsed machine kept reporting
+//   normal-looking stats and a viewer could not tell a walk from a collapse.
 ```
 
 ---
@@ -617,8 +659,9 @@ single-velocity-pass solver at fixed `dt = 1/120`; position-level (XPBD) notes i
 //
 // If you keep an EXPLICIT damper instead (tau = kp*e - kd*wRel applied openly),
 // the caps are mandatory and assertable at build time:
-//   kd*dt/I  < 1        (2 = divergence; past it the joint bang-bangs the
-//                        ceiling at 9-21 Hz and shakes the whole machine)
+//   kd*dt/I  < 2 hard (divergence); DESIGN to <= 1 — cap kd per joint. Past the
+//                bound the joint bang-bangs the ceiling at 9-21 Hz and shakes
+//                the whole machine.
 //   kp*dt*dt/I < 1      (this one diverges WITH more iterations, not fewer —
 //                        soften kp, don't iterate harder)
 //   (kd + 2*sqrt(tauMax*kv))*dt/I < 2
@@ -672,6 +715,18 @@ stands 10 s, |accel| quiet;  walks 20 m without a fall;
 mortar impulse -> falls -> ASSERT walk controller stopped and servos limp
 (a walk controller driving a downed mech is the tear-everything mode);
 respawn -> stands again.
+// ONE CONSTRUCTION SITE: the gate MUST build its world through the exact same
+// build function/manifest the game ships — never its own copy. Our test harness
+// silently diverged from the artifact three times in ONE DAY until this was
+// structural; every number it printed described a machine nobody was driving.
+// GATE != VERIFICATION. The automated gate is necessary, not sufficient: a
+// human drive is the real acceptance. Structure it: a requirement-gated drive
+// card — scripted segments (stand/walk/turn/strafe...) that only bank time
+// while the sticks actually satisfy the requirement, stamped into the log.
+// A countdown card that advances regardless certifies nothing (we shipped one).
+// And test stability changes on cases that FAIL — a passing scenario cannot
+// show improvement (recorded after testing a balance fix on a case that never
+// fell and almost dropping the fix).
 // ENSEMBLES, NOT SINGLE RUNS. The walk is deterministic but chaotic: a 1.9e-16
 // relative parameter change moved a fall from 178 s to 23 s in ours. Gate on
 // N=5 runs with nanometre-scale spawn jitter and count survivals; a single
@@ -696,6 +751,15 @@ respawn -> stands again.
 Out of scope, deliberately: quadruped/crawler gaits (our quad runs a separate
 static-crawl controller and is not part of this spec) and stand-up-after-fall
 (we respawn; a get-up behaviour is its own project).
+
+Process rules that paid for themselves: (1) ONE RULE, ONE SITE — any value two
+subsystems need is derived once and passed; five of our worst bugs were one rule
+written at two sites and updated at one. (2) Design notes are not authority —
+re-measure any documented constant against the assembled machine before trusting
+it (our "0.73 ratio" note was 5.6-7.5x off reality by the time three multipliers
+had stacked). (3) `restExt 0.93` has a measured penalty: at 0.983 standing slide
+tripled and saturated-joint count went 10% -> 29%. (4) Our strideCap 0.28·L is
+deliberately conservative pending a sweep of the newer steering geometry.
 
 Tuning order if it misbehaves: mass layout → timestep scaling → kd caps → kCapture
 (lower it if catches overshoot and ring) → agility AG. Everything else stays derived.
