@@ -492,6 +492,9 @@ machine against foot friction (~4°/step, all it can do alone).
 ```js
 // - Ring limits/slew DERIVE from the rig's own end stops: limit = 0.9 * stopRange,
 //   rate = fullTravel / stepPeriod. Never restate them controller-side.
+// - The ring's reference yaw must be the MEASURED body yaw, not read back from
+//   the same commanded quaternion the leg geometry uses — commanded-vs-commanded
+//   self-cancels to exactly 0 at every heading and the rings never steer.
 // - Steer ONLY during single support: stance ring turns the chassis over the
 //   planted foot, swing ring pre-rotates the landing foot. In double support both
 //   feet are planted — commanding the rings just grinds the soles.
@@ -675,6 +678,11 @@ single-velocity-pass solver at fixed `dt = 1/120`; position-level (XPBD) notes i
 // bumper, ~1e-7 rad per N·m at our reference torques) and its impulse counts
 // toward the mount's failure/damage budget. A rigid stop with a discarded
 // multiplier can silently carry 40 kN·m and read zero in telemetry — measured.
+// UPSTREAM DISCIPLINE, as important as the stop itself: clamp EVERY commanded
+// joint target to 95% of its declared range BEFORE it reaches the servo. An IK
+// that commands 30.5° against a 30° stop parks the joint ON the stop with the
+// stop carrying up to 2.2x the actuator's own authority, continuously — that
+// tore our ankle off while "nothing" was commanding anything unusual.
 ```
 
 ```js
