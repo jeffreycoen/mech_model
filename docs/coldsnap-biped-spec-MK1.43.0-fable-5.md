@@ -135,10 +135,20 @@ function deriveGait(L, comH, halfStance, foot, g = 9.81) {
     copClamp   : 0.45 * (L / 2.95),           // max CoP correction vs plan, m (ref leg 2.95)
     halfStance,
     minFootSep : Math.min(2*foot.halfWid + 0.06*(L/2.95), 1.9*halfStance), // never cross
-    splayMax   : 1.40,                        // max separation / nominal stance
+    splayMax   : 1.40,                        // HARD ceiling / nominal stance. The
+                                              // working bound is ADAPTIVE: nominal
+                                              // + this step's commanded lateral
+                                              // stride + any catch correction —
+                                              // a static bound clamps away the
+                                              // strafe AND the lateral catch
     yawPerStep : 8 * Math.PI/180,             // 5° for tall/narrow rigs
     turnRate   : (8 * Math.PI/180) / (tSS + tDS), // DERIVED — command can't outrun legs
     travelRate : 0.6 * Math.sqrt(L / 2.95),   // stick-command slew, m/s per s
+    pelvisRate : 3 * (0.28*L) / (tSS + tDS),  // pelvis-reference slew: 3x max walk
+                                              // speed — never binds in normal
+                                              // travel, exists so a reference STEP
+                                              // becomes a ramp (a stepped pelvis
+                                              // reference launched ours mid-air)
     kDCM       : 2.0,                         // ankle CoP feedback gain (>1 = stable)
     kCapture   : 1.0,                         // foothold feedback; 0.65 if legs heavy
     capCommit  : 0.5,                         // freeze catch target at 50% of swing
@@ -177,7 +187,11 @@ function deriveGait(L, comH, halfStance, foot, g = 9.81) {
 //   (planned print + committed capture correction), vertical sin^2 lift.
 // TOUCHDOWN (the handshake, once per step — most bugs live here):
 //   - MEASURE where the foot actually landed; that becomes the print (pin its
-//     lateral toward nominal stance ~20%/step or stance narrows and legs cross)
+//     lateral toward nominal stance ~20%/step or stance narrows and legs cross).
+//     Lateral regulation is THREE small gains at three sites, not one: swing
+//     target blend toward nominal (~0.22), recorded-print pin at touchdown
+//     (~0.22), and a gentle pair-centre pull (~0.18) — the centre is otherwise
+//     a free integrator and the machine wanders off its line.
 //   - advance the tracked pair-centre by the commanded travel (sagittal slaved
 //     to measurement so travel stays honest; lateral stays commanded = no drift)
 //   - LATCH the slewed command as next step's stride; replan the DCM references
@@ -197,6 +211,10 @@ function capturePoint(com, comVel, g) {
   const om = Math.sqrt(g / Math.max(1e-4, com.y));
   return { x: com.x + comVel.x / om, z: com.z + comVel.z / om };
 }
+// TWO OMEGAS, deliberately: while a plan is RUNNING, evaluate xi at the PLAN's
+// omega (the pendulum its references were built against); in STAND/stop, at the
+// live sqrt(g/comHeight) above (no plan exists; the stale plan's height is
+// whatever the last walk crouched at). One formula, two frequency sources.
 ```
 
 ```js
@@ -241,9 +259,18 @@ function copCommand(zmpRef, xiErr, hold, k) {
     z: zmpRef.z + clamp(k.kDCM * hold.cop.z, -k.copClamp, k.copClamp),
   };
   // Ankle pitch torque ≈ -kCop * stanceLoad * (copX - footX), roll likewise,
-  // kCop = 0.40, only while that foot is loaded. Clamp inside the physical sole.
+  // kCop = 0.40 (ship 0.40 on EVERY rig — set it explicitly per preset; a
+  // different library default silently overriding it cost us a rig that was
+  // thrown by its own ankles). Only while that foot is loaded.
+  // ROTATE the CoP error into the FOOT's own frame before it becomes ankle
+  // torque — world-frame error on a turned foot mixes the axes.
+  // CAP the load used for feedforward at ~1.5x bodyweight: landing spikes
+  // otherwise multiply straight into ankle torque.
   // ROLL FF only in SINGLE support: with both feet down, lateral balance is the
   // weight split between feet, and ankle-roll torque just twists the soles.
+  // In STAND (no plan): run the same CoP law against the capture point directly
+  // (gain ~1.6 toward xi), and command the REST POSE bias (our hips -9°, knee
+  // 18°, ankle -9°) as targets — not zero angles; zero is a straight-leg pose.
 }
 ```
 
@@ -326,6 +353,8 @@ function rampedTimes(k, rampK) { return { tSS: k.tSS * rampK, tDS: k.tDS * rampK
 //      makes the plan stable to follow — forward integration amplifies e^(wt).
 //   2. com reference forward:  com(t+dt) = xi(t) + (com(t) - xi(t)) * e^(-omega*dt)
 //      (from comDot = -omega*(com - xi), the stable half of the LIP split).
+//      Semi-implicit Euler of this ODE is fine at any sane dt — it is the
+//      stable direction; only the xi pass needs the exact backward exponentials.
 // TRACKING at runtime (§2 copCommand): commanded zmp = zmpRef + kDCM*(xiMeas-xiRef).
 // Why kDCM > 1 is stable — substitute into (1):
 //   errDot = omega*err - omega*kDCM*err = omega*(1-kDCM)*err  -> decays for kDCM>1.
@@ -482,6 +511,9 @@ yaws and conflating them caused a whole class of bugs:
 // tore both arms and the head off in 5 sessions of 6. EVERY channel gets a rate.
 // waistFollow = 0.6: legs start walking the chassis around only once the ring
 // has used 60% of its travel — aim is instant, chassis rotation is earned.
+// CLAMP the aim so it never leads the chassis heading by more than the ring's
+// reachable travel — an aim parked past the end stop holds the ring ON the stop
+// and grinds the mounts while "nothing" is happening (tore ankles in STAND).
 ```
 
 ## 5d. Steering: hip-yaw rings
@@ -501,6 +533,11 @@ machine against foot friction (~4°/step, all it can do alone).
 // - ONE turning parameter: yawPerStep (8° standard, 5° tall/narrow rigs).
 //   turnRate = yawPerStep / stepPeriod. The stick integrates a HEADING at
 //   turnRate; never step the heading by thumb position.
+// - Cap each step's yaw against the MEASURED body yaw, not the commanded frame,
+//   or the command runs steps ahead of what the legs delivered (our logs: 132-174°
+//   ahead at every turning fall before this).
+// - Heading deadband is TWO thresholds with hysteresis (ours 4° hold / 14° act):
+//   one threshold re-triggers walking forever on the residual left after a turn.
 ```
 
 ## 5e. Mounts, damage, and structural rules
