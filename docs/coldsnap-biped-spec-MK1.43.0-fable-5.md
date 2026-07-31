@@ -237,6 +237,8 @@ function copCommand(zmpRef, xiErr, hold, k) {
   };
   // Ankle pitch torque ≈ -kCop * stanceLoad * (copX - footX), roll likewise,
   // kCop = 0.40, only while that foot is loaded. Clamp inside the physical sole.
+  // ROLL FF only in SINGLE support: with both feet down, lateral balance is the
+  // weight split between feet, and ankle-roll torque just twists the soles.
 }
 ```
 
@@ -535,6 +537,18 @@ game, no estimator needed. Two derived instruments are worth porting anyway:
 //   red   : beyond any single step — physically unrecoverable, expect the fall
 // It warned 0.08-0.92s ahead of 5 of 6 real falls. Cheap and it makes failures
 // legible to players and to CI alike.
+//
+// TELEMETRY DESIGN (for the gate and any tuning session):
+// - Per-joint fields must be SUBSTEP EXTREMES over the sample window (peak |rate|,
+//   peak torque, saturated-fraction), never single-substep snapshots — a snapshot
+//   of a bang-banging actuator is noise; ours sampled 1 substep in 232 and whole
+//   sessions were unreadable. Log the DEMAND before the torque clamp too: "railed
+//   at 1.05x ceiling" and "railed at 40x" have opposite remedies.
+// - Keep a small ring buffer of EVERY sim step (~1 s), dumped only on trigger
+//   (fall, break, airborne, impact > 4W, IK unreachable, servo railed) — failures
+//   live at sim rate, sampling channels alias them.
+// - Stamp EVERY log and artifact with the build version; derive the stamp from
+//   one constant. An unversioned log cost us a full driving session's diagnosis.
 ```
 
 ---
@@ -657,6 +671,10 @@ respawn -> stands again.
    number that was wrong when typed and had no check.
 
 1–4 walks. 5 decides whether it *keeps* walking. 6 makes it feel planted. 7 keeps it true.
+
+Out of scope, deliberately: quadruped/crawler gaits (our quad runs a separate
+static-crawl controller and is not part of this spec) and stand-up-after-fall
+(we respawn; a get-up behaviour is its own project).
 
 Tuning order if it misbehaves: mass layout → timestep scaling → kd caps → kCapture
 (lower it if catches overshoot and ring) → agility AG. Everything else stays derived.
